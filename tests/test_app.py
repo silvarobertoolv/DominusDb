@@ -40,3 +40,36 @@ def test_jobs_lock_mutations(client):
 def test_validation_and_errors_do_not_echo_secrets(client):
     response=post(client,'/api/connect/source',{'password':'secret-test'})
     assert response.status_code==400 and b'secret-test' not in response.data
+
+
+def test_plan_failure_returns_context_and_redacts_driver_credentials(client, monkeypatch):
+    import app as module
+    import sqlalchemy as sa
+    from migration import PlanError
+    # A URL-bearing stub avoids making a real network connection.
+    from types import SimpleNamespace
+    state['source'] = SimpleNamespace(url=sa.URL.create('mssql+pymssql', username='admin-example', password='secret-password', host='localhost'))
+    def fail(*args):
+        original = RuntimeError(229, b'permission denied admin-example password=secret-password')
+        wrapped = sa.exc.OperationalError('SECRET SQL', {'x': 'SECRET DATA'}, original)
+        raise PlanError('Ler índices', 'dbo.Clientes', wrapped)
+    monkeypatch.setattr(module, 'plan', fail)
+    response = post(client, '/api/plan', {'tables':['dbo.Clientes']})
+    assert response.status_code == 400
+    payload = response.get_json()
+    assert payload['diagnostic']['stage'] == 'Ler índices'
+    assert payload['diagnostic']['object'] == 'dbo.Clientes'
+    assert '229' in payload['error'] and 'permission denied' in payload['error']
+    for private in ('secret-password', 'admin-example', 'SECRET SQL', 'SECRET DATA'):
+        assert private not in response.get_data(as_text=True)
+    assert state['plan'] is None
+
+
+def test_unexpected_plan_error_is_not_reported_as_permission_problem(client, monkeypatch):
+    import app as module
+    state['source'] = object()
+    def fail(*args): raise TypeError('unexpected metadata value')
+    monkeypatch.setattr(module, 'plan', fail)
+    response = post(client, '/api/plan', {'tables':['dbo.Example']})
+    assert 'TypeError' in response.get_json()['error']
+    assert 'unexpected metadata value' in response.get_json()['error']

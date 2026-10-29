@@ -77,3 +77,7 @@ Uso previsto: uma pessoa e uma migração por vez, na máquina local. Estado, pl
 ```
 
 No Windows, substitua `.venv/bin/python` por `.venv\Scripts\python.exe`. Os testes verificam conversões de tipos, fluxo HTTP, bloqueio CSRF, preservação de tabelas existentes, cópia em lotes e contagens usando SQLite, e compilação de DDL MySQL. Não substituem testes integrados SQL Server 2008 → MySQL 8, que exigem servidores acessíveis e credenciais.
+
+## Diagnóstico de falhas no plano
+
+Se a geração do plano falhar, a interface mantém um quadro com referência do erro, etapa, objeto e mensagem original do driver (quando disponível). A mesma mensagem é registrada no terminal. Copie esse diagnóstico ao relatar uma falha: ele distingue erros de catálogo, reflexão, conversão e compilação do DDL. Uma conta administradora não resolve falhas de compatibilidade ou de metadados. Credenciais conhecidas da origem são ocultadas e a exceção SQLAlchemy não é exibida com SQL e parâmetros. O diagnóstico pode conter nomes de objetos; revise antes de compartilhar.

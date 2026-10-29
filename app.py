@@ -1,13 +1,14 @@
 import io
 import json
 import secrets
+import re
 import threading
 import zipfile
 from functools import wraps
 from flask import Flask, request, session, jsonify, render_template, send_file
 import sqlalchemy as sa
 from sqlalchemy.engine import URL
-from migration import inventory, plan, execute
+from migration import inventory, plan, execute, PlanError
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
@@ -80,6 +81,33 @@ def scan():
     except Exception: return error('Falha na leitura do catálogo. Confira permissões de metadados (VIEW DEFINITION).')
 
 
+
+def plan_diagnostic(exc):
+    cause = exc.cause
+    original = getattr(cause, 'orig', cause)
+    # Never stringify a SQLAlchemy DBAPIError: it includes SQL and parameters.
+    message = str(original)
+    if getattr(original, 'args', None):
+        message = ' | '.join(arg.decode('utf-8', errors='replace') if isinstance(arg, bytes) else str(arg) for arg in original.args)
+    engine = state['source']
+    url = getattr(engine, 'url', None)
+    for secret in (getattr(url, 'password', None), getattr(url, 'username', None)):
+        if secret:
+            message = message.replace(str(secret), '[oculto]')
+    message = re.sub(r'(?i)(?:mssql|mysql|https?)://[^\s]+', '[conexão oculta]', message)
+    message = re.sub(r'(?i)((?:password|pwd|senha)\s*[=:]\s*)([^;\s]+)', r'\1[oculto]', message)
+    message = message.split('[SQL:')[0].split('[parameters:')[0][:3000]
+    reference = secrets.token_hex(6)
+    detail = {'reference': reference, 'stage': exc.stage, 'object': exc.object_name,
+              'exception': type(cause).__name__, 'driver_exception': type(original).__name__,
+              'message': message or 'Exceção sem mensagem.'}
+    text = (f"Falha ao gerar plano [{reference}]. Etapa: {exc.stage}. "
+            f"Objeto: {exc.object_name or 'catálogo'}. "
+            f"{type(cause).__name__} / {type(original).__name__}: {detail['message']}")
+    app.logger.error('%s', text)
+    return jsonify(error=text, diagnostic=detail), 400
+
+
 @app.post('/api/plan')
 @idle
 def make_plan():
@@ -90,10 +118,11 @@ def make_plan():
         if not isinstance(selected, list) or not all(isinstance(x, str) for x in selected): return error('Seleção inválida.')
         prepared = plan(state['source'], selected)
         prepared['id'] = secrets.token_urlsafe(24)
+        response = jsonify(id=prepared['id'], ddl=prepared['ddl'], warnings=prepared['warnings'], errors=prepared['errors'], objects=prepared['objects'], tables=[{'source': s.fullname, 'target': d.name, 'columns': [{'name': c.name, 'type': str(c.type.compile(dialect=sa.dialects.mysql.dialect()))} for c in d.columns]} for s,d in prepared['pairs']])
         state['plan'] = prepared
-        return jsonify(id=prepared['id'], ddl=prepared['ddl'], warnings=prepared['warnings'], errors=prepared['errors'], objects=prepared['objects'], tables=[{'source': s.fullname, 'target': d.name, 'columns': [{'name': c.name, 'type': str(c.type.compile(dialect=sa.dialects.mysql.dialect()))} for c in d.columns]} for s,d in prepared['pairs']])
-    except ValueError as exc: return error(str(exc))
-    except Exception: return error('Não foi possível gerar o plano. Confira permissões e objetos da origem.')
+        return response
+    except PlanError as exc: return plan_diagnostic(exc)
+    except Exception as exc: return plan_diagnostic(PlanError('Preparar resposta do plano', None, exc))
 
 
 @app.post('/api/run')

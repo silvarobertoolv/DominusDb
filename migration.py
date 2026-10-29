@@ -52,7 +52,21 @@ def inventory(engine):
     return {'tables': tables, 'objects': objects}
 
 
+class PlanError(Exception):
+    def __init__(self, stage, object_name, cause):
+        self.stage, self.object_name, self.cause = stage, object_name, cause
+        super().__init__(f'{stage}: {type(cause).__name__}')
+
+
 def plan(engine, selected):
+    context = {'stage': 'Ler catálogo', 'object': None}
+    try:
+        return _plan(engine, selected, context)
+    except Exception as exc:
+        raise PlanError(context['stage'], context['object'], exc) from exc
+
+
+def _plan(engine, selected, context):
     catalog = inventory(engine)
     available = {t['id']: t for t in catalog['tables']}
     if not selected or len(selected) != len(set(selected)) or any(x not in available for x in selected):
@@ -62,15 +76,17 @@ def plan(engine, selected):
     pairs, warnings, errors = [], [], []
     for key in selected:
         item = available[key]
+        context.update(stage='Refletir colunas, PKs e relacionamentos', object=key)
         src = sa.Table(item['name'], source, schema=item['schema'], autoload_with=engine, resolve_fks=False)
         pk = set(c.name for c in src.primary_key.columns)
         columns = []
         for col in src.columns:
+            context.update(stage='Converter coluna', object=f'{key}.{col.name}')
             try:
                 if len(col.name) > 64: raise ValueError('nome de coluna excede o limite de 64 caracteres do MySQL')
                 typ = convert_type(col.type)
                 columns.append(sa.Column(col.name, typ, nullable=False if col.name in pk else col.nullable, primary_key=col.name in pk, autoincrement=False))
-                if col.default or col.server_default or col.computed or col.identity:
+                if any(value is not None for value in (col.default, col.server_default, col.computed, col.identity)):
                     warnings.append(f'{key}.{col.name}: valor copiado; default, cálculo ou identity não recriados.')
                 if type(col.type).__name__.upper() in ('DATETIME2', 'TIME'):
                     warnings.append(f'{key}.{col.name}: MySQL preserva até 6 casas de segundo; SQL Server pode ter 7.')
@@ -83,6 +99,7 @@ def plan(engine, selected):
     mapping = {(s.schema, s.name): d for s, d in pairs}
     inspector = sa.inspect(engine)
     for src, dst in pairs:
+        context.update(stage='Ler índices', object=src.fullname)
         for index in inspector.get_indexes(src.name, schema=src.schema):
             cols = index.get('column_names', [])
             options = index.get('dialect_options') or {}
@@ -90,17 +107,19 @@ def plan(engine, selected):
             if special or not cols or any(c not in dst.c for c in cols):
                 warnings.append(f'{src.fullname}: índice {index["name"]} exige revisão.'); continue
             sa.Index(target_name(dst.name, index['name']), *[dst.c[c] for c in cols], unique=index.get('unique', False))
+        context.update(stage='Ler chaves estrangeiras', object=src.fullname)
         for fk in inspector.get_foreign_keys(src.name, schema=src.schema):
             ref = mapping.get((fk.get('referred_schema') or src.schema, fk['referred_table']))
             if ref is None:
                 warnings.append(f'{src.fullname}: FK {fk["name"]} omitida; tabela referenciada fora da seleção.'); continue
             if any(c not in dst.c for c in fk['constrained_columns']) or any(c not in ref.c for c in fk['referred_columns']): continue
             options = fk.get('options') or {}
-            if any(options.get(k, '').upper() == 'SET DEFAULT' for k in ('ondelete', 'onupdate')):
+            if any((options.get(k) or '').upper() == 'SET DEFAULT' for k in ('ondelete', 'onupdate')):
                 errors.append(f'{src.fullname}: FK {fk["name"]} usa SET DEFAULT, não suportado no MySQL.'); continue
             dst.append_constraint(sa.ForeignKeyConstraint([dst.c[c] for c in fk['constrained_columns']], [ref.c[c] for c in fk['referred_columns']], name=target_name(dst.name, fk['name'] or 'fk'), use_alter=True, ondelete=options.get('ondelete'), onupdate=options.get('onupdate')))
         # SQLAlchemy's MSSQL dialect exposes UNIQUEs through get_indexes,
         # and does not implement get_unique_constraints/get_check_constraints.
+        context.update(stage='Ler restrições UNIQUE', object=src.fullname)
         try:
             uniques = inspector.get_unique_constraints(src.name, schema=src.schema)
         except NotImplementedError:
@@ -110,6 +129,7 @@ def plan(engine, selected):
             cols = unique.get('column_names', [])
             if cols and tuple(cols) not in indexed_unique and all(c in dst.c for c in cols):
                 dst.append_constraint(sa.UniqueConstraint(*cols, name=target_name(dst.name, unique['name'] or 'uq')))
+        context.update(stage='Ler restrições CHECK', object=src.fullname)
         try:
             checks = inspector.get_check_constraints(src.name, schema=src.schema)
         except NotImplementedError:
@@ -119,8 +139,12 @@ def plan(engine, selected):
     warnings.append('Collation utf8mb4_bin: ordenação e comparação podem diferir da origem. Revise chaves únicas, texto e regras de negócio.')
     warnings.append('Views, procedures, funções, triggers, sequences e synonyms são exportados para revisão; não executados automaticamente.')
     dialect = mysql.dialect()
-    statements = [str(CreateTable(d).compile(dialect=dialect))+';' for _, d in pairs]
-    for _, d in pairs:
+    statements = []
+    for src, d in pairs:
+        context.update(stage='Compilar CREATE TABLE para MySQL', object=src.fullname)
+        statements.append(str(CreateTable(d).compile(dialect=dialect))+';')
+    for src, d in pairs:
+        context.update(stage='Compilar índices e FKs para MySQL', object=src.fullname)
         statements += [str(CreateIndex(i).compile(dialect=dialect))+';' for i in d.indexes]
         statements += [str(AddConstraint(f).compile(dialect=dialect))+';' for f in d.foreign_key_constraints]
     return {'pairs': pairs, 'ddl': '\n\n'.join(statements), 'warnings': warnings, 'errors': errors, 'objects': catalog['objects']}

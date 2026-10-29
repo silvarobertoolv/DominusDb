@@ -90,3 +90,35 @@ def test_plan_handles_mssql_unsupported_reflection_methods(monkeypatch):
     monkeypatch.setattr(migration.sa,'inspect',lambda _: inspector)
     prepared=migration.plan(engine,['main.data'])
     assert not prepared['errors'] and 'CREATE TABLE' in prepared['ddl']
+
+
+def test_reflection_failure_preserves_stage_table_and_original_error(monkeypatch):
+    import migration
+    monkeypatch.setattr(migration, 'inventory', lambda _: {'tables':[{'id':'dbo.orders','schema':'dbo','name':'orders'}], 'objects':[]})
+    def fail(*args, **kwargs): raise RuntimeError('metadata reflection failed')
+    monkeypatch.setattr(migration.sa, 'Table', fail)
+    with pytest.raises(migration.PlanError) as caught:
+        migration.plan(object(), ['dbo.orders'])
+    assert caught.value.object_name == 'dbo.orders'
+    assert caught.value.stage == 'Refletir colunas, PKs e relacionamentos'
+    assert str(caught.value.cause) == 'metadata reflection failed'
+
+
+def test_nullable_foreign_key_actions_do_not_crash_plan(monkeypatch):
+    import migration
+    engine=sa.create_engine('sqlite://')
+    meta=sa.MetaData(schema='main')
+    parent=sa.Table('parent',meta,sa.Column('id',sa.Integer,primary_key=True))
+    sa.Table('child',meta,sa.Column('pid',sa.Integer),sa.ForeignKeyConstraint(['pid'],[parent.c.id]))
+    meta.create_all(engine)
+    monkeypatch.setattr(migration,'inventory',lambda _: {'tables':[{'id':'main.parent','schema':'main','name':'parent'},{'id':'main.child','schema':'main','name':'child'}],'objects':[]})
+    inspector=sa.inspect(engine)
+    get_fks=inspector.get_foreign_keys
+    def null_actions(*args, **kwargs):
+        result=get_fks(*args, **kwargs)
+        for fk in result: fk['options']={'ondelete':None,'onupdate':None}
+        return result
+    inspector.get_foreign_keys=null_actions
+    monkeypatch.setattr(migration.sa,'inspect',lambda _:inspector)
+    prepared=migration.plan(engine,['main.parent','main.child'])
+    assert not prepared['errors'] and 'FOREIGN KEY' in prepared['ddl']
