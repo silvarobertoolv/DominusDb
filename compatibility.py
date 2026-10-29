@@ -40,10 +40,13 @@ def source_dictionary(engine, table):
                        TYPE_NAME(c.system_type_id) AS base_type,
                        c.max_length AS max_length_bytes, c.precision AS [precision],
                        c.scale, c.is_nullable, c.is_identity, c.is_computed,
-                       c.collation_name
+                       c.collation_name, dc.definition AS default_definition,
+                       cc.definition AS computed_definition, cc.is_persisted
                 FROM sys.tables t JOIN sys.schemas s ON s.schema_id=t.schema_id
                 JOIN sys.columns c ON c.object_id=t.object_id
                 JOIN sys.types ut ON ut.user_type_id=c.user_type_id
+                LEFT JOIN sys.default_constraints dc ON dc.object_id=c.default_object_id
+                LEFT JOIN sys.computed_columns cc ON cc.object_id=c.object_id AND cc.column_id=c.column_id
                 WHERE s.name=:schema AND t.name=:table ORDER BY c.column_id
             '''), {'schema': table.schema, 'table': table.name}).mappings()]
     return [dict(column_name=c.name, declared_type=str(c.type), base_type=type(c.type).__name__,
@@ -121,6 +124,7 @@ def check_and_adapt(pairs, limits):
     # Preserve local FK columns even when the referenced table was not selected.
     for src, dst in pairs:
         protected[dst.name].update(c.name for c in src.columns if c.foreign_keys)
+        protected[dst.name].update(src.info.get('source_fk_columns', set()))
 
     for src, table in pairs:
         table.dialect_options['mysql']['row_format'] = 'DYNAMIC'

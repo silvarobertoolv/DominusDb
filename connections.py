@@ -21,6 +21,9 @@ def engine_for(data, kind):
                    host=data['host'].strip(),port=port,database=None if destination=='oracle' else data['database'],query=query)
     extra={}
     if destination=='mssql':
+        mode=data.get('metadata_mode','auto')
+        if mode not in ('auto','catalog'): raise ValueError('Modo de metadados inválido.')
+        extra['supports_comments']=False
         args=dict(login_timeout=10,timeout=timeout,charset='UTF-8',encryption='require' if data.get('tls',True) else 'off',tds_version='7.3',use_datetime2=True)
     elif destination=='mysql':
         args=dict(connect_timeout=10,read_timeout=timeout,write_timeout=timeout,charset='utf8mb4',cursorclass=WarningTrackingCursor)
@@ -34,6 +37,7 @@ def engine_for(data, kind):
         if data.get('tls'):args.update(protocol='tcps',ssl_server_dn_match=True)
         extra['max_identifier_length']=30
     engine=sa.create_engine(url,connect_args=args,pool_pre_ping=True,hide_parameters=True,echo=False,**extra)
+    if destination=='mssql': engine._sqlbridge_metadata_mode=mode
     schema=data.get('schema','').strip() if kind=='target' else ''
     engine._sqlbridge_schema=(schema or 'public') if destination=='postgresql' else (schema.upper() or None) if destination=='oracle' else None
     if destination=='oracle':

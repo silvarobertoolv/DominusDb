@@ -3,6 +3,7 @@ from diagnostics import diagnostic
 from type_mapping import parse_target_type, validate_overrides
 from transfer import copy_table, TransferControl, MigrationCancelled, activity
 from compatibility import source_dictionary
+from source_catalog import source_inspector, reflect_source_table
 from target_profiles import destination_kind, destination_schema, dialect_for, identifier, convert_native_type, target_limits, check_and_adapt, KINDS
 from datetime import datetime, timezone
 import sqlalchemy as sa
@@ -65,7 +66,7 @@ def dictionary_type(column, definition):
 
 
 def inventory(engine):
-    inspector = sa.inspect(engine)
+    inspector = source_inspector(engine)
     tables = []
     for schema in inspector.get_schema_names():
         if schema.lower() in ('sys', 'information_schema', 'guest'): continue
@@ -121,9 +122,14 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
     for key in selected:
         item = available[key]
         context.update(stage='Refletir colunas, PKs e relacionamentos', object=key)
-        src = sa.Table(item['name'], source, schema=item['schema'], autoload_with=engine, resolve_fks=False)
+        src = reflect_source_table(engine, item['name'], item['schema'], source, dictionary_type)
+        if src.info.get('reflection_mode') == 'catalog':
+            warnings.append(f'{key}: metadados lidos pelo catálogo compatível sys.*; comentários estendidos não são refletidos. PKs, índices e relacionamentos continuam sendo lidos.')
+            if src.info.get('reflection_fallback_code'):
+                warnings.append(f'{key}: reflexão SQLAlchemy falhou com sintaxe {src.info["reflection_fallback_code"]}; leitura recuperada automaticamente pelo catálogo compatível.')
         context.update(stage='Consultar dicionário sys.columns/sys.types', object=key)
-        definitions = source_dictionary(engine, src)
+        definitions = src.info.get('source_dictionary')
+        if definitions is None: definitions = source_dictionary(engine, src)
         dictionary.append({'table': key, 'columns': definitions})
         if engine.dialect.name == 'mssql' and len(definitions) != len(src.columns):
             errors.append(f'{key}: dicionário incompleto ou estrutura alterada durante a leitura. Confira permissões de metadados e gere o plano novamente.')
@@ -151,7 +157,7 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
                 typ = parse_target_type(manual, kind) if manual is not None else automatic
                 entry['target_type'] = str(typ.compile(dialect=dialect))
                 columns.append(sa.Column(col.name, typ, nullable=False if col.name in pk else col.nullable,
-                                         primary_key=col.name in pk, autoincrement=False,
+                                         autoincrement=False,
                                          info={'manual_type': manual is not None}))
                 if manual is not None:
                     warnings.append(f'{key}.{col.name}: tipo escolhido manualmente: {entry["target_type"]}. Revise a compatibilidade dos valores; a escolha não transforma os dados de origem.')
@@ -166,11 +172,13 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
                 errors.append(f'{key}.{col.name}: {exc}')
         table_options = dict(mysql_engine='InnoDB', mysql_charset='utf8mb4', mysql_collate='utf8mb4_bin') if kind == 'mysql' else dict(schema=schema)
         dst = sa.Table(named(item['schema'], item['name']), destination, *columns, **table_options)
+        pk_order=[c.name for c in src.primary_key.columns]
+        if pk_order and all(name in dst.c for name in pk_order): dst.append_constraint(sa.PrimaryKeyConstraint(*pk_order))
         pairs.append((src, dst))
     names = [dst.name.casefold() for _, dst in pairs]
     if len(names) != len(set(names)): errors.append(f'Colisão de nomes em {label}; renomeie as tabelas de origem.')
     mapping = {(s.schema, s.name): d for s, d in pairs}
-    inspector = sa.inspect(engine)
+    inspector = source_inspector(engine)
     for src, dst in pairs:
         context.update(stage='Ler índices', object=src.fullname)
         for index in inspector.get_indexes(src.name, schema=src.schema):
@@ -229,6 +237,7 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
     compatibility['target_schema'] = schema
     warnings.extend(compatibility.get('warnings', []))
     compatibility['source_dictionary'] = dictionary
+    compatibility['source_reflection'] = [{'table': src.fullname, 'mode': src.info.get('reflection_mode','sqlalchemy'), 'fallback_code': src.info.get('reflection_fallback_code')} for src,_ in pairs]
     compatibility['manual_mappings'] = overrides
     errors.extend(compatibility['errors'])
     for change in compatibility['changes']:

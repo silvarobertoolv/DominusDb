@@ -3,6 +3,8 @@ import re
 import secrets
 
 MYSQL_HINTS = {
+    102: ('sintaxe/compatibilidade de origem', 'Se ocorrer na reflexão, reconecte usando Catálogo compatível. A aplicação usa fallback para metadados sys.* sem alterar o SQL Server.'),
+    156: ('sintaxe/compatibilidade de origem', 'Confira a etapa; na reflexão use Catálogo compatível e gere novamente o plano.'),
     229: ('permissão de origem', 'Confira SELECT e VIEW DEFINITION para o usuário no banco de origem.'),
     18456: ('autenticação de origem', 'Confira autenticação SQL Server, usuário e senha.'),
     1044: ('permissão', 'Conceda acesso ao banco de destino.'),
