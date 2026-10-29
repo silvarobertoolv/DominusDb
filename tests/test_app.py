@@ -102,3 +102,23 @@ def test_report_survives_new_plan_and_exposes_object_results(client):
     assert response.status_code==200
     assert response.get_json()['events'][0]['diagnostic']['code']==1071
     assert 'attachment' in response.headers['Content-Disposition']
+
+
+def test_plan_api_and_zip_include_adapted_ddl_and_dictionary(client, monkeypatch):
+    import sqlalchemy as sa
+    import migration
+    import io,json,zipfile
+    source=sa.create_engine('sqlite://')
+    sa.Table('wide',sa.MetaData(schema='main'),sa.Column('id',sa.Integer,primary_key=True),*[sa.Column('c'+str(i),sa.String(4000)) for i in range(10)]).metadata.create_all(source)
+    state.update(source=source,target=sa.create_engine('sqlite://'))
+    monkeypatch.setattr(migration,'inventory',lambda _:dict(tables=[dict(id='main.wide',schema='main',name='wide')],objects=[]))
+    response=post(client,'/api/plan',dict(tables=['main.wide']))
+    assert response.status_code==200
+    data=response.get_json()
+    assert data['compatibility']['changes'] and not data['errors']
+    assert 'TEXT' in data['ddl'] and 'ROW_FORMAT=DYNAMIC' in data['ddl']
+    assert data['destination_check']==[dict(table='main__wide',exists=False)]
+    archive=zipfile.ZipFile(io.BytesIO(client.get('/api/export').data))
+    report=json.loads(archive.read('compatibilidade.json'))
+    assert report['changes']==data['compatibility']['changes']
+    assert report['source_dictionary'][0]['table']=='main.wide'

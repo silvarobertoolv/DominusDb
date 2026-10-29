@@ -1,9 +1,10 @@
 """SQL Server inventory and conservative MySQL migration planner."""
 import hashlib
 from diagnostics import diagnostic
+from compatibility import target_limits, source_dictionary, check_and_adapt
 from datetime import datetime, timezone
 import sqlalchemy as sa
-from sqlalchemy.dialects import mysql
+from sqlalchemy.dialects import mysql, mssql
 from sqlalchemy.schema import CreateTable, AddConstraint, CreateIndex
 
 
@@ -17,7 +18,12 @@ def convert_type(t):
     if name in ('TINYINT', 'SMALLINT', 'INTEGER', 'INT', 'BIGINT'):
         return {'TINYINT': mysql.TINYINT(unsigned=True), 'SMALLINT': sa.SmallInteger(), 'INTEGER': sa.Integer(), 'INT': sa.Integer(), 'BIGINT': sa.BigInteger()}[name]
     if name in ('DECIMAL', 'NUMERIC', 'MONEY', 'SMALLMONEY'):
-        return sa.Numeric(getattr(t, 'precision', None) or (19 if name == 'MONEY' else 10), getattr(t, 'scale', None) if getattr(t, 'scale', None) is not None else 4)
+        precision = getattr(t, 'precision', None) or (19 if name == 'MONEY' else 10)
+        scale = getattr(t, 'scale', None)
+        if scale is None: scale = 4 if name in ('MONEY', 'SMALLMONEY') else 0
+        if precision > 65 or scale > 30 or scale > precision:
+            raise ValueError(f'DECIMAL({precision},{scale}) excede os limites MySQL (precisão 65, escala 30); reduzir escala automaticamente perderia dados')
+        return sa.Numeric(precision, scale)
     if name in ('BIT', 'BOOLEAN'): return sa.Boolean()
     if name in ('FLOAT', 'REAL', 'DOUBLE'): return mysql.DOUBLE()
     if name in ('DATE',): return sa.Date()
@@ -25,12 +31,35 @@ def convert_type(t):
     if name == 'TIME': return mysql.TIME(fsp=6)
     if name == 'DATETIMEOFFSET': raise ValueError('datetimeoffset exige política explícita de fuso horário')
     if name in ('TIMESTAMP', 'ROWVERSION'): return mysql.BINARY(8)
+    if name == 'BINARY' and getattr(t, 'length', None) and t.length <= 255: return mysql.BINARY(t.length)
+    if name in ('BINARY', 'VARBINARY') and getattr(t, 'length', None) and 0 < t.length <= 65535: return mysql.VARBINARY(t.length)
     if name in ('BINARY', 'VARBINARY', 'IMAGE', 'LARGEBINARY'): return mysql.LONGBLOB()
     if name in ('UNIQUEIDENTIFIER', 'UUID'): return sa.String(36)
     if name in ('VARCHAR', 'NVARCHAR', 'CHAR', 'NCHAR', 'TEXT', 'NTEXT', 'XML', 'UNICODE', 'UNICODETEXT', 'STRING'):
         n = getattr(t, 'length', None)
         return sa.String(n) if n and 0 < n <= 4000 else mysql.LONGTEXT()
     raise ValueError(f'tipo {name} requer mapeamento manual')
+
+
+def dictionary_type(column, definition):
+    """Resolve declared byte lengths and alias base types using sys.columns."""
+    base = str(definition.get('base_type') or '').lower()
+    length = definition.get('max_length_bytes')
+    if base in ('varchar', 'nvarchar', 'char', 'nchar', 'binary', 'varbinary') and length is not None:
+        length = int(length)
+        if length < 0: length = None
+        elif base in ('nvarchar', 'nchar'): length //= 2  # sys.columns reports UTF-16 bytes.
+        return getattr(mssql, base.upper())(length=length)
+    if base in ('numeric', 'decimal') and definition.get('precision') is not None and definition.get('scale') is not None:
+        return sa.Numeric(int(definition['precision']), int(definition['scale']))
+    known = {'int': sa.Integer, 'smallint': sa.SmallInteger, 'bigint': sa.BigInteger,
+             'tinyint': mssql.TINYINT, 'bit': mssql.BIT, 'money': mssql.MONEY,
+             'smallmoney': mssql.SMALLMONEY, 'text': mssql.TEXT, 'ntext': mssql.NTEXT,
+             'image': mssql.IMAGE, 'xml': mssql.XML, 'uniqueidentifier': mssql.UNIQUEIDENTIFIER,
+             'timestamp': mssql.TIMESTAMP, 'datetimeoffset': mssql.DATETIMEOFFSET,
+             'date': mssql.DATE, 'datetime': mssql.DATETIME, 'datetime2': mssql.DATETIME2,
+             'smalldatetime': mssql.SMALLDATETIME, 'time': mssql.TIME, 'float': mssql.FLOAT, 'real': mssql.REAL}
+    return known[base]() if base in known else column.type
 
 
 def inventory(engine):
@@ -59,15 +88,15 @@ class PlanError(Exception):
         super().__init__(f'{stage}: {type(cause).__name__}')
 
 
-def plan(engine, selected):
+def plan(engine, selected, target=None):
     context = {'stage': 'Ler catálogo', 'object': None}
     try:
-        return _plan(engine, selected, context)
+        return _plan(engine, selected, context, target)
     except Exception as exc:
         raise PlanError(context['stage'], context['object'], exc) from exc
 
 
-def _plan(engine, selected, context):
+def _plan(engine, selected, context, target=None):
     catalog = inventory(engine)
     available = {t['id']: t for t in catalog['tables']}
     if not selected or len(selected) != len(set(selected)) or any(x not in available for x in selected):
@@ -75,21 +104,31 @@ def _plan(engine, selected, context):
     source = sa.MetaData()
     destination = sa.MetaData()
     pairs, warnings, errors = [], [], []
+    dictionary = []
+    limits, limit_warnings = target_limits(target)
+    warnings.extend(limit_warnings)
     for key in selected:
         item = available[key]
         context.update(stage='Refletir colunas, PKs e relacionamentos', object=key)
         src = sa.Table(item['name'], source, schema=item['schema'], autoload_with=engine, resolve_fks=False)
+        context.update(stage='Consultar dicionário sys.columns/sys.types', object=key)
+        definitions = source_dictionary(engine, src)
+        dictionary.append({'table': key, 'columns': definitions})
+        if engine.dialect.name == 'mssql' and len(definitions) != len(src.columns):
+            errors.append(f'{key}: dicionário incompleto ou estrutura alterada durante a leitura. Confira permissões de metadados e gere o plano novamente.')
+        definitions_by_name = {d['column_name']: d for d in definitions}
         pk = set(c.name for c in src.primary_key.columns)
         columns = []
         for col in src.columns:
             context.update(stage='Converter coluna', object=f'{key}.{col.name}')
             try:
                 if len(col.name) > 64: raise ValueError('nome de coluna excede o limite de 64 caracteres do MySQL')
-                typ = convert_type(col.type)
+                resolved_type = dictionary_type(col, definitions_by_name.get(col.name, {}))
+                typ = convert_type(resolved_type)
                 columns.append(sa.Column(col.name, typ, nullable=False if col.name in pk else col.nullable, primary_key=col.name in pk, autoincrement=False))
                 if any(value is not None for value in (col.default, col.server_default, col.computed, col.identity)):
                     warnings.append(f'{key}.{col.name}: valor copiado; default, cálculo ou identity não recriados.')
-                if type(col.type).__name__.upper() in ('DATETIME2', 'TIME'):
+                if type(resolved_type).__name__.upper() in ('DATETIME2', 'TIME'):
                     warnings.append(f'{key}.{col.name}: MySQL preserva até 6 casas de segundo; SQL Server pode ter 7.')
             except ValueError as exc:
                 errors.append(f'{key}.{col.name}: {exc}')
@@ -136,6 +175,13 @@ def _plan(engine, selected, context):
         except NotImplementedError:
             checks = []  # CHECK definitions are included in the sys.objects export.
         if checks: warnings.append(f'{src.fullname}: CHECK constraints exigem adaptação manual.')
+    context.update(stage='Checar limites e adaptar DDL para MySQL', object=None)
+    compatibility = check_and_adapt(pairs, limits)
+    compatibility['source_dictionary'] = dictionary
+    errors.extend(compatibility['errors'])
+    for change in compatibility['changes']:
+        warnings.append(f"{change['table']}.{change['column']}: {change['before']} → {change['after']} automaticamente. {change['reason']}")
+    warnings.append('DATE/DATETIME: SQL Server pode conter anos anteriores a 1000 que não cabem no intervalo documentado do MySQL. O dicionário não valida os valores; datas não são reescritas automaticamente.')
     warnings.append('Identity, defaults, expressões calculadas e CHECKs não são recriados. PKs, índices comuns, UNIQUEs e FKs entre tabelas selecionadas são incluídos. Revise diferenças de UNIQUE com NULL, collation e limites de índices do MySQL.')
     warnings.append('Collation utf8mb4_bin: ordenação e comparação podem diferir da origem. Revise chaves únicas, texto e regras de negócio.')
     warnings.append('Views, procedures, funções, triggers, sequences e synonyms são exportados para revisão; não executados automaticamente.')
@@ -155,7 +201,7 @@ def _plan(engine, selected, context):
             compile_ddl(CreateIndex(index), 'Compilar índice para MySQL', index.name)
         for fk in sorted(d.foreign_key_constraints, key=lambda f: f.name):
             compile_ddl(AddConstraint(fk), 'Compilar FK para MySQL', fk.name)
-    return {'pairs': pairs, 'ddl': '\n\n'.join(statements), 'warnings': warnings, 'errors': errors, 'objects': catalog['objects']}
+    return {'compatibility': compatibility, 'pairs': pairs, 'ddl': '\n\n'.join(statements), 'warnings': warnings, 'errors': errors, 'objects': catalog['objects']}
 
 
 class MigrationError(Exception):

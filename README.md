@@ -102,3 +102,21 @@ No Windows, substitua `.venv/bin/python` por `.venv\Scripts\python.exe`. Os test
 ## Diagnóstico de falhas no plano
 
 Se a geração do plano falhar, a interface mantém um quadro com referência do erro, etapa, objeto e mensagem original do driver (quando disponível). A mesma mensagem é registrada no terminal. Copie esse diagnóstico ao relatar uma falha: ele distingue erros de catálogo, reflexão, conversão e compilação do DDL. Uma conta administradora não resolve falhas de compatibilidade ou de metadados. Credenciais conhecidas da origem são ocultadas e a exceção SQLAlchemy não é exibida com SQL e parâmetros. O diagnóstico pode conter nomes de objetos; revise antes de compartilhar.
+
+## Checagem prévia do dicionário e adaptação do tamanho da linha
+
+A geração do plano consulta `sys.columns`, `sys.types`, `sys.tables` e `sys.schemas` no SQL Server 2008+ para obter tipo declarado, tipo-base (inclusive aliases), comprimento máximo em bytes, precisão, escala, nulabilidade, identity, cálculo e collation. Usa parâmetros para schema/tabela. NVARCHAR/NCHAR têm comprimento em bytes dividido por dois para obter caracteres; `MAX` não é reduzido. A reflexão também fornece PKs, índices, UNIQUEs e FKs.
+
+Quando o destino está conectado, consulta `VERSION()` e `@@innodb_page_size`. O plano usa InnoDB com **ROW_FORMAT=DYNAMIC** e **utf8mb4 (até 4 bytes/caractere)**. Na ausência dessa consulta, informa a hipótese de MySQL 8 com página de 16 KiB; gere novamente com o destino conectado para confirmar. Versões diferentes de MySQL 8/9 recebem aviso para revisão. A página de 4/8/16 KiB corresponde a orçamento de índice de 768/1536/3072 bytes; páginas maiores permanecem em 3072.
+
+Para antecipar o **erro 1118**, estima o tamanho lógico máximo declarado por linha, com margem (orçamento de 60.000 bytes contra limite SQL de 65.535), e o registro local do InnoDB DYNAMIC. Este segundo cálculo aproxima ponteiros externos de campos variáveis grandes, metadados e campos fixos; não é uma simulação exata do InnoDB.
+
+Se a linha exceder um dos orçamentos, tenta ampliar colunas **sem chaves/índices** de VARCHAR para TEXT/MEDIUMTEXT/LONGTEXT, e VARBINARY para BLOB/MEDIUMBLOB/LONGBLOB. Escolhe capacidade suficiente para o máximo declarado, considerando utf8mb4, e começa pelas maiores colunas. Nenhum conteúdo é cortado nem o comprimento é reduzido com base nos dados atuais. A conversão para LOB pode mudar as características de armazenamento e desempenho; revise a lista de ajustes. A DDL já é gerada com os tipos adaptados.
+
+Colunas de PK, UNIQUE, índices e dos dois lados de FKs selecionadas são protegidas; colunas locais de FKs fora da seleção também não são transformadas. A aplicação não cria prefixos automaticamente nem remove essas regras. Se o limite continuar excedido, bloqueia a execução e indica a tabela para revisão. Não altera tabelas já existentes: o modo pular continua preservando-as integralmente.
+
+A checagem também antecipa índices longos (1071), TEXT/BLOB indexados sem prefixo (1170), excesso de colunas no InnoDB (1017), excesso de campos em índices (16), tipos diferentes nos lados de uma FK (3780) e DECIMAL com escala superior a 30 ou precisão superior a 65. Chaves não são encurtadas e números não são arredondados automaticamente para contornar esses limites. Binários de tamanho finito são mantidos como BINARY/VARBINARY quando cabem; `MAX`/IMAGE permanecem LONGBLOB.
+
+Na interface, abra **Checagem de compatibilidade e ajustes da DDL** e **Dicionário de dados consultado**. O ZIP do plano inclui `compatibilidade.json`; o relatório da execução também mantém essa análise. O mapeamento de colunas e o SQL exibem os tipos finais.
+
+**Limites da análise:** não varre os registros nem garante que todo valor será aceito pelo servidor. Valores pequenos que permaneçam inline, configuração/versão do MySQL, packet size, collations, regras de UNIQUE, datas anteriores a 1000 e outras diferenças semânticas ainda podem causar falhas durante a carga. Tipos desconhecidos/espaciais e DATETIMEOFFSET continuam exigindo decisão manual. A carga estrita e o relatório por objeto permanecem ativos. Valide uma cópia de teste no MySQL real antes de usar o banco migrado.
