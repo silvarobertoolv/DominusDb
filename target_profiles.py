@@ -112,7 +112,7 @@ def target_limits(engine=None, kind='mysql'):
     if not limits['verified']: warnings.append(f'{KINDS[kind]}: estimativas conservadoras assumidas; valide versão, encoding e limites com o destino conectado.')
     if kind=='oracle':
         warnings += ['Oracle: nomes gerados limitados a 30 bytes; VARCHAR2/RAW usam limites STANDARD. Nenhum parâmetro do servidor é alterado.',
-                     'Oracle trata string vazia como NULL, inclusive em NVARCHAR2/CLOB. A carga interrompe se encontrar texto vazio; defina uma transformação de negócio fora da aplicação.',
+                     'Oracle trata string vazia como NULL. Por padrão a carga interrompe; se permitido pelo negócio, escolha Converter textos vazios para NULL (somente colunas textuais que aceitem NULL). Binários vazios continuam exigindo tratamento específico.',
                      'Oracle: TIME torna-se INTERVAL DAY TO SECOND (dias=0). Revise consultas e regras que esperem um tipo hora.']
     else:
         warnings.append('PostgreSQL: TEXT/VARCHAR/BYTEA usam TOAST automaticamente. Não existe a regra MySQL de 65.535 bytes; strings com caractere NUL são rejeitadas na carga.')

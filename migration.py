@@ -374,7 +374,9 @@ def execute(source, target, prepared, job, batch, existing_policy='abort', conti
                 loaded.add(dst.name)
                 job['tables'].append(result)
                 message = f"{result['copied']} registros confirmados. " + (f"Contagem no destino: {result['target_count']}." if result['target_count'] is not None else 'COUNT(*) dispensado por opção; validação limitada aos COMMITs.')
-                record('data', dst.name, dst.name, 'copied', message, rows=result['copied'])
+                conversions=result.get('empty_to_null_confirmed',{})
+                if conversions: message+=f' {sum(conversions.values())} valores de texto vazio convertidos para NULL por opção explícita.'
+                record('data', dst.name, dst.name, 'copied', message, rows=result['copied'], empty_to_null_confirmed=conversions)
             except MigrationCancelled:
                 record('data', dst.name, dst.name, 'cancelled', 'Carga cancelada; transação pendente revertida. COMMITs anteriores, se houver, permanecem. Confira métricas e destino.')
                 raise
@@ -404,7 +406,7 @@ def execute(source, target, prepared, job, batch, existing_policy='abort', conti
                     record('foreign_key', fk.name, dst.name, 'created', result.pop('message'), **result)
                 except Exception as exc: failure(exc, 'foreign_key', fk.name, dst.name)
         has_errors = any(e['status'] == 'failed' for e in job['events'])
-        has_warnings = any(e['status'] == 'skipped' or e.get('warnings') for e in job['events'])
+        has_warnings = any(e['status'] == 'skipped' or e.get('warnings') or e.get('empty_to_null_confirmed') for e in job['events'])
         status = 'completed_with_errors' if has_errors else 'completed_with_warnings' if has_warnings else 'completed'
         with control.condition:
             if control.cancelled: raise MigrationCancelled('Cancelamento solicitado.')

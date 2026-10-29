@@ -184,7 +184,7 @@ No ambiente virtual Windows, use `.venv\Scripts\python.exe -m pip install -r req
 - Nomes de tabelas/índices/constraints são gerados em minúsculas lógicas (não exigem aspas para nomes simples) com hash para respeitar 30 bytes, por compatibilidade conservadora. Colunas mantêm os nomes originais quando cabem; acima de 30 bytes ou `ROWID` maiúsculo ficam bloqueadas. Não é assumido suporte a identificadores estendidos ou MAX_STRING_SIZE=EXTENDED.
 - Inteiros/decimais viram NUMBER, BIT vira NUMBER(1,0), Unicode/textos curtos viram NVARCHAR2 e longos/MAX viram NCLOB. Esse uso do charset nacional evita depender do charset principal para preservar Unicode. Binários pequenos viram RAW; longos viram BLOB; GUID vira NVARCHAR2(36). VARCHAR2/NVARCHAR2 manuais têm limite conservador de 1.000 caracteres; RAW, 2.000 bytes.
 - DATETIME/DATETIME2 tornam-se TIMESTAMP com precisão 6. DATETIMEOFFSET usa TIMESTAMP WITH TIME ZONE com bind explícito DB_TYPE_TIMESTAMP_TZ; offset ausente é rejeitado. TIME vira INTERVAL DAY(1) TO SECOND(6), com zero dias: é uma representação de duração/hora e exige revisar regras e consultas que esperem o tipo TIME.
-- **Oracle não distingue texto vazio de NULL.** O perfil interrompe a carga ao encontrar strings ou binários vazios, evitando mudança silenciosa de significado; decida e aplique a transformação de negócio na origem/preparação dos dados. LOBs vazios também exigem tratamento específico, não presumido pelo carregador.
+- **Oracle não distingue texto vazio de NULL.** Por padrão o perfil interrompe a carga ao encontrar strings ou binários vazios. É possível autorizar a conversão de textos vazios para NULL em colunas textuais que aceitem NULL, conforme a opção descrita abaixo. Binários continuam exigindo tratamento específico. LOBs vazios também exigem tratamento específico, não presumido pelo carregador.
 - LOBs não entram em índices/FKs convencionais. UNIQUEs de índices simples da origem são emitidos como constraints UNIQUE, para que possam ser referenciados por FKs no Oracle. Isso pode antecipar sua validação para a fase de carga. ON UPDATE com ação de propagação não é silenciosamente descartado: o plano bloqueia e informa a incompatibilidade.
 
 ### Confirmação, relatórios e transações nos novos destinos
@@ -212,3 +212,20 @@ No modo **Automática com fallback de compatibilidade**, uma falha de sintaxe 10
 Para forçar essa leitura, selecione **Catálogo compatível (SQL Server 2008+)** na conexão de origem, teste/conecte novamente, leia o catálogo e gere um novo plano. Essa opção também se aplica ao inventário e à leitura de índices/constraints. Mantém tipos-base e aliases, tamanhos, nulabilidade, ordem de PK composta, índices simples/UNIQUE, FKs e as informações de defaults, identity e colunas calculadas usadas nos avisos do plano. Comentários estendidos não são necessários nem migrados por esse caminho. Cálculos/defaults/identity/CHECKs continuam com as mesmas limitações de conversão já documentadas.
 
 A aplicação não modifica compatibilidade do banco, permissões, objetos ou dados da origem. Erros de autenticação, permissões (por exemplo 229), rede e tipos não são tratados como erros de sintaxe e continuam sendo reportados. O catálogo exige visibilidade de metadados; se uma definição calculada necessária estiver invisível, o plano informa a ausência. Se o próprio leitor de catálogo falhar, a causa é exibida: o fallback não garante corrigir todo erro 102 em qualquer contexto, especialmente fora da reflexão.
+
+## Oracle: opção para converter textos vazios em NULL
+
+A mensagem `valor vazio não pode ser preservado como distinto de NULL` sinaliza uma diferença entre os bancos: SQL Server distingue `''` de NULL; Oracle não preserva essa distinção em seus tipos de texto usuais. A aplicação mantém a política conservadora por padrão.
+
+Após gerar o plano com Oracle como destino, escolha em **Oracle · tratamento de textos vazios**:
+
+- **Interromper ao encontrar texto vazio**: padrão; não transforma os valores.
+- **Converter textos vazios para NULL em colunas que aceitem NULL**: autorização explícita para substituir somente a string exatamente vazia por NULL no payload enviado ao Oracle. A origem permanece intacta. A opção é registrada na execução, e a conclusão com conversões recebe o estado de pendências/avisos para revisão.
+
+A conversão exige tipo textual no destino (VARCHAR2/NVARCHAR2/CHAR/NCHAR/CLOB/NCLOB etc.) e nulabilidade confirmada. **PKs e colunas NOT NULL não são relaxadas automaticamente**: o erro identifica a coluna e pede um valor de negócio definido na preparação dos dados. Escolher NULL não resolve um campo obrigatório. Texto vazio destinado a NUMBER/data ou outro tipo não textual também exige transformação específica.
+
+Não há trim, substituição por espaço, zero, data padrão ou palavra `NULL`. Strings com espaços, textos não vazios e NULLs já existentes permanecem iguais. Binários vazios (RAW/BLOB, inclusive bytes vazios) não são convertidos por essa opção. MySQL e PostgreSQL continuam preservando texto vazio como antes.
+
+O monitor e o JSON da execução mostram **empty_to_null_prepared** e **empty_to_null_confirmed**, com contagem de valores por tabela/coluna, sem expor os registros. Preparados são tentativas de transformação em memória, inclusive lotes que podem não chegar a ser gravados; confirmados só aumentam depois de COMMIT bem-sucedido. Em reversão por tabela, confirmados ficam zerados; no modo por lote, conversões de lotes anteriores confirmados permanecem contabilizadas mesmo se a tabela falhar depois. Uma perda de conexão durante COMMIT continua exigindo inspeção do destino.
+
+Para tentar novamente após uma falha, revise primeiro as tabelas criadas e os COMMITs existentes. O modo pular preserva tabelas existentes e não completa cargas parciais; use um banco/schema de teste novo ou remova manualmente somente os artefatos da tentativa anterior após avaliação. Não há retomada automática de tabela parcial.

@@ -82,7 +82,8 @@ def row_bytes(row):
     return sum(len(v.encode('utf-8')) if isinstance(v, str) else len(v) if isinstance(v, (bytes, bytearray, memoryview)) else 24 for v in row) + 16 * len(row)
 
 
-def payload_chunks(rows, names, uuid_columns, max_bytes, destination=None, column_types=None):
+def payload_chunks(rows, names, uuid_columns, max_bytes, destination=None, column_types=None, oracle_empty_text='error', column_nullable=None, conversion_counts=None):
+    if oracle_empty_text not in ('error','null'): raise ValueError('Política de texto vazio inválida.')
     payload, size = [], 0
     for row in rows:
         cost = row_bytes(row)
@@ -97,9 +98,19 @@ def payload_chunks(rows, names, uuid_columns, max_bytes, destination=None, colum
                 if value is None: continue
                 if destination=='postgresql' and isinstance(value,str) and '\x00' in value:
                     raise ValueError(f'{name}: PostgreSQL não aceita caractere NUL em texto. Transformação manual necessária.')
-                if destination=='oracle' and (isinstance(value,str) and value=='' or isinstance(value,(bytes,bytearray,memoryview)) and len(value)==0):
-                    raise ValueError(f'{name}: valor vazio não pode ser preservado como distinto de NULL no perfil Oracle; transformação manual necessária.')
                 typ=(column_types or {}).get(name)
+                if destination=='oracle' and isinstance(value,str) and value=='':
+                    if oracle_empty_text=='error':
+                        raise ValueError(f'{name}: texto vazio é distinto de NULL na origem. Se a regra de negócio permitir, escolha Converter textos vazios para NULL nas opções Oracle.')
+                    textual=isinstance(typ,sa.String) or type(typ).__name__.upper() in ('CLOB','NCLOB')
+                    if not textual: raise ValueError(f'{name}: texto vazio em destino não textual exige transformação específica; não será convertido automaticamente.')
+                    if (column_nullable or {}).get(name) is not True:
+                        raise ValueError(f'{name}: conversão de texto vazio para NULL bloqueada: coluna NOT NULL/PK ou nulabilidade não confirmada. Defina um valor de negócio na origem; a aplicação não altera a restrição.')
+                    entry[name]=None
+                    if conversion_counts is not None: conversion_counts[name]=conversion_counts.get(name,0)+1
+                    continue
+                if destination=='oracle' and isinstance(value,(bytes,bytearray,memoryview)) and len(value)==0:
+                    raise ValueError(f'{name}: binário vazio exige tratamento específico de RAW/BLOB no Oracle; a opção de textos vazios não altera binários.')
                 if getattr(typ,'timezone',False):
                     if isinstance(value,str):
                         try: value=datetime.fromisoformat(value[:-1]+'+00:00' if value.endswith('Z') else value)
@@ -127,13 +138,16 @@ def copy_table(source, target, src, dst, job, batch, options, control):
                    validation_seconds=0., elapsed_seconds=0., rows_per_second=0., eta_seconds=None,
                    last_batch_rows=0, last_batch_bytes=0, last_progress_at=now(),
                    target_count=None, validation='pending', estimate_note=None,
-                   effective_max_batch_bytes=options.get('max_batch_mb', 8)*1024*1024, unconfirmed_rows=0)
+                   effective_max_batch_bytes=options.get('max_batch_mb', 8)*1024*1024, unconfirmed_rows=0,
+                   empty_to_null_prepared={}, empty_to_null_confirmed={})
     job.setdefault('table_progress', []).append(metrics)
     names = list(src.c.keys())
     uuid_columns = [c.name for c in src.columns if type(c.type).__name__.upper() in ('UNIQUEIDENTIFIER', 'UUID')]
     destination=target.dialect.name
     target_label={'mysql':'MySQL','postgresql':'PostgreSQL','oracle':'Oracle'}.get(destination,'destino')
     column_types={c.name:c.type for c in dst.columns}
+    column_nullable={c.name:c.nullable for c in dst.columns}
+    pending_conversions={}
     stmt = dst.insert()  # Compile/cache the statement across batches.
     max_bytes = options.get('max_batch_mb', 8) * 1024 * 1024
     per_batch = options.get('transaction_mode', 'table') == 'batch'
@@ -155,6 +169,10 @@ def copy_table(source, target, src, dst, job, batch, options, control):
         activity(job, 'Aguardando COMMIT no '+target_label)
         stamp = time.perf_counter(); out.commit()
         metrics['commit_seconds'] += time.perf_counter() - stamp
+        confirmed=dict(metrics['empty_to_null_confirmed'])
+        for name,count in pending_conversions.items():confirmed[name]=confirmed.get(name,0)+count
+        metrics['empty_to_null_confirmed']=confirmed
+        pending_conversions.clear()
         metrics['confirmed_rows'] += pending
         job['rows'] += pending
         pending = 0
@@ -189,9 +207,10 @@ def copy_table(source, target, src, dst, job, batch, options, control):
                     metrics['read_seconds'] += time.perf_counter() - stamp
                     if not rows: break
                     activity(job, 'Preparando lote em memória')
-                    chunks = iter(payload_chunks(rows, names, uuid_columns, max_bytes, destination, column_types))
+                    chunks = iter(payload_chunks(rows, names, uuid_columns, max_bytes, destination, column_types, options.get('oracle_empty_text','error'), column_nullable, metrics['empty_to_null_prepared']))
                     while True:
                         stamp = time.perf_counter()
+                        previous_conversions=dict(metrics['empty_to_null_prepared'])
                         try: payload, size = next(chunks)
                         except StopIteration: break
                         metrics['prepare_seconds'] += time.perf_counter() - stamp
@@ -208,6 +227,9 @@ def copy_table(source, target, src, dst, job, batch, options, control):
                                 if warnings: raise RuntimeError(int(warnings[0][1]), 'Aviso no INSERT; lote pendente revertido para evitar conversão silenciosa.')
                                 if warning_count: raise RuntimeError('Avisos em sublotes do INSERT; mensagem anterior indisponível. Transação pendente revertida para evitar conversão silenciosa.')
                         metrics['write_seconds'] += time.perf_counter() - stamp
+                        for name,count in metrics['empty_to_null_prepared'].items():
+                            delta=count-previous_conversions.get(name,0)
+                            if delta: pending_conversions[name]=pending_conversions.get(name,0)+delta
                         copied += len(payload); pending += len(payload)
                         metrics.update(batches=metrics['batches']+1, last_batch_rows=len(payload), last_batch_bytes=size, last_progress_at=now())
                         sample = size / len(payload)
@@ -235,4 +257,5 @@ def copy_table(source, target, src, dst, job, batch, options, control):
         pending = 0
         refresh()
     return dict(source=src.fullname, target=dst.name, copied=copied, target_count=actual,
-                confirmed_rows=metrics['confirmed_rows'], validation=metrics['validation'])
+                confirmed_rows=metrics['confirmed_rows'], validation=metrics['validation'],
+                empty_to_null_confirmed=dict(metrics['empty_to_null_confirmed']))

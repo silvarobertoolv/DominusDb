@@ -223,3 +223,19 @@ def test_oracle_connection_probe_uses_dual(client,monkeypatch):
     monkeypatch.setattr(module,'engine_for',lambda data,kind:engine)
     assert post(client,'/api/connect/target',dict(db_type='oracle')).status_code==200
     assert calls==['SELECT 1 FROM DUAL']
+
+
+def test_oracle_empty_text_policy_is_validated_and_passed_to_worker(client,monkeypatch):
+    import app as module
+    state.update(source=object(),target=object(),plan=dict(id='p',errors=[],target_kind='oracle'))
+    captured={}
+    class Thread:
+        def __init__(self,target,args,daemon):captured['options']=args[7]
+        def start(self):pass
+    monkeypatch.setattr(module.threading,'Thread',Thread)
+    assert post(client,'/api/run',dict(plan_id='p',confirmation='MIGRAR',oracle_empty_text='null')).status_code==200
+    assert captured['options']['oracle_empty_text']=='null'
+    state['job']=None
+    assert post(client,'/api/run',dict(plan_id='p',confirmation='MIGRAR',oracle_empty_text='replace')).status_code==400
+    state['plan']['target_kind']='postgresql'
+    assert post(client,'/api/run',dict(plan_id='p',confirmation='MIGRAR',oracle_empty_text='null')).status_code==400

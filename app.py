@@ -133,7 +133,10 @@ def run():
     if transaction_mode not in ('table', 'batch'): return error('Modo de transação inválido.')
     if not isinstance(verify_count, bool): return error('Opção de contagem deve ser booleana.')
     if isinstance(max_batch_mb, bool) or not isinstance(max_batch_mb, int) or not 1 <= max_batch_mb <= 64: return error('Limite do lote deve ser entre 1 e 64 MiB.')
-    options = dict(transaction_mode=transaction_mode, verify_count=verify_count, max_batch_mb=max_batch_mb)
+    oracle_empty_text = data.get('oracle_empty_text','error')
+    if oracle_empty_text not in ('error','null'): return error('Política de texto vazio inválida.')
+    if oracle_empty_text != 'error' and prepared.get('target_kind','mysql') != 'oracle': return error('Conversão de textos vazios é uma opção exclusiva do Oracle.')
+    options = dict(oracle_empty_text=oracle_empty_text, transaction_mode=transaction_mode, verify_count=verify_count, max_batch_mb=max_batch_mb)
     control = TransferControl(batch)
     job = {'id': secrets.token_hex(12), 'control_history': [], 'target_kind': prepared.get('target_kind','mysql'), 'target_schema': prepared.get('target_schema'), 'plan_id': prepared['id'], 'plan_warnings': prepared.get('warnings', []), 'compatibility': prepared.get('compatibility'), 'manual_mappings': prepared.get('manual_mappings', {}), 'status': 'queued', 'rows': 0, 'logs': [], 'tables': [], 'stage': 'Preparando'}
     state['job'] = job
@@ -154,7 +157,7 @@ def job_status():
               'table_progress', 'started_at', 'finished_at', 'summary', 'error', 'diagnostic', 'options')
     result = {k: job[k] for k in fields if k in job}
     events = list(job.get('events', []))
-    if 'table_progress' in result: result['table_progress'] = [dict(item) for item in list(result['table_progress'])]
+    if 'table_progress' in result: result['table_progress'] = [dict(item, empty_to_null_confirmed=dict(item.get('empty_to_null_confirmed',{})), empty_to_null_prepared=dict(item.get('empty_to_null_prepared',{}))) for item in list(result['table_progress'])]
     result.update(events=events[after:after+200], next_cursor=min(len(events), after+200),
                   events_total=len(events), logs=job.get('logs', [])[-30:])
     now = datetime.now(timezone.utc)
