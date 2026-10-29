@@ -122,3 +122,173 @@ def test_nullable_foreign_key_actions_do_not_crash_plan(monkeypatch):
     monkeypatch.setattr(migration.sa,'inspect',lambda _:inspector)
     prepared=migration.plan(engine,['main.parent','main.child'])
     assert not prepared['errors'] and 'FOREIGN KEY' in prepared['ddl']
+
+
+def add_second_table(source):
+    src=sa.Table('more', sa.MetaData(), sa.Column('id', sa.Integer, primary_key=True))
+    src.create(source)
+    with source.begin() as conn: conn.execute(src.insert(), {'id':42})
+    dst=sa.Table('dbo__more', sa.MetaData(), sa.Column('id', sa.Integer, primary_key=True))
+    return src,dst
+
+
+def test_skip_existing_preserves_data_and_continues_with_new_table():
+    source,target,src,dst=pair()
+    dst.create(target)
+    with target.begin() as conn: conn.execute(dst.insert(), {'id':99,'name':'keep'})
+    src2,dst2=add_second_table(source)
+    job={}
+    execute(source,target,{'pairs':[(src,dst),(src2,dst2)],'errors':[]},job,3,'skip',True)
+    assert job['status']=='completed_with_warnings'
+    assert job['rows']==1
+    assert any(e['object']==dst.name and e['status']=='skipped' for e in job['events'])
+    with target.connect() as conn:
+        assert conn.scalar(sa.select(dst.c.name))=='keep'
+        assert conn.scalar(sa.select(dst2.c.id))==42
+
+
+def test_creation_failure_does_not_prevent_other_table_migration():
+    source,target,src,dst=pair()
+    # MySQL-specific type unsupported by SQLite simulates a DDL incompatibility.
+    dst.c.name.type=mysql.LONGTEXT()
+    src2,dst2=add_second_table(source)
+    job={}
+    execute(source,target,{'pairs':[(src,dst),(src2,dst2)],'errors':[]},job,3,'skip',True)
+    assert job['status']=='completed_with_errors'
+    assert job['rows']==1
+    failed=next(e for e in job['events'] if e['status']=='failed')
+    assert failed['object']==dst.name and failed['diagnostic']['exception']=='CompileError'
+    assert not sa.inspect(target).has_table(dst.name)
+    assert any(e['kind']=='data' and e['object']==dst.name and e['status']=='skipped' for e in job['events'])
+
+
+def test_copy_failure_rolls_back_table_and_continues():
+    source,target,src,dst=pair()
+    dst.c.name.type=sa.Integer()  # SQLite dynamic types do not reject this.
+    # Force a duplicate unique key halfway into the batch copy instead.
+    with source.begin() as conn: conn.execute(src.update().values(name='duplicate'))
+    dst.append_constraint(sa.UniqueConstraint('name'))
+    src2,dst2=add_second_table(source)
+    job={}
+    execute(source,target,{'pairs':[(src,dst),(src2,dst2)],'errors':[]},job,3,'skip',True)
+    assert job['status']=='completed_with_errors' and job['rows']==1
+    assert job['rows_in_flight']==0
+    with target.connect() as conn: assert conn.scalar(sa.select(sa.func.count()).select_from(dst))==0
+    assert not any(e['kind']=='data' and e['object']==dst.name and e['status']=='copied' for e in job['events'])
+
+
+def test_stop_after_error_does_not_attempt_other_tables():
+    source,target,src,dst=pair();dst.c.name.type=mysql.LONGTEXT()
+    src2,dst2=add_second_table(source);job={}
+    execute(source,target,{'pairs':[(src,dst),(src2,dst2)],'errors':[]},job,3,'skip',False)
+    assert job['status']=='failed' and not sa.inspect(target).has_table(dst2.name)
+    assert any(e['object']==dst2.name and e['status']=='skipped' for e in job['events'])
+
+
+def test_successful_ddl_and_index_are_verified_in_catalog():
+    source,target,src,dst=pair();sa.Index('ix_name',dst.c.name);job={}
+    execute(source,target,{'pairs':[(src,dst)],'errors':[]},job,3,'skip',True)
+    assert job['status']=='completed'
+    created=[e for e in job['events'] if e['status']=='created']
+    assert len(created)==2 and all(e['verified'] for e in created)
+    assert job['summary']=={'created':2,'copied':1,'failed':0,'skipped':0}
+
+
+def test_skipped_reference_prevents_fk_creation_on_new_table():
+    source,target,src,dst=pair();dst.create(target)
+    src2,dst2=add_second_table(source)
+    dst2.append_constraint(sa.ForeignKeyConstraint([dst2.c.id],[dst.c.id],name='fk_people',use_alter=True))
+    job={};execute(source,target,{'pairs':[(src,dst),(src2,dst2)],'errors':[]},job,3,'skip',True)
+    assert job['status']=='completed_with_warnings'
+    fk=next(e for e in job['events'] if e['kind']=='foreign_key')
+    assert fk['status']=='skipped' and 'referenciada' in fk['message']
+
+
+def test_index_error_does_not_prevent_other_index_creation(monkeypatch):
+    import migration
+    source,target,src,dst=pair()
+    sa.Index('a_bad',dst.c.name);sa.Index('b_good',dst.c.id)
+    original=migration._create_object
+    def create(target,element,kind,table,name):
+        if name=='a_bad': raise sa.exc.OperationalError('hidden SQL',{},RuntimeError(1071,'key too long'))
+        return original(target,element,kind,table,name)
+    monkeypatch.setattr(migration,'_create_object',create)
+    job={};execute(source,target,{'pairs':[(src,dst)],'errors':[]},job,3,'skip',True)
+    assert job['status']=='completed_with_errors'
+    error=next(e for e in job['events'] if e['object']=='a_bad')
+    assert error['diagnostic']['code']==1071 and error['diagnostic']['category']=='limite de índice'
+    assert any(e['object']=='b_good' and e['status']=='created' for e in job['events'])
+
+
+def test_mysql_data_error_does_not_disclose_row_values():
+    from diagnostics import diagnostic
+    exc=sa.exc.IntegrityError('SQL SECRET',{'record':'PARAM SECRET'},RuntimeError(1062,"Duplicate entry 'customer-secret' for key 'unique'"))
+    detail=diagnostic(exc,'Copiar dados','dbo__clients',hide_values=True)
+    assert detail['code']==1062 and 'duplicados' in detail['hint']
+    assert all(secret not in str(detail) for secret in ('SQL SECRET','PARAM SECRET','customer-secret'))
+
+
+def test_mysql_ddl_captures_server_warnings_and_show_create(monkeypatch):
+    import migration
+    source,target,src,dst=pair()
+    class Result:
+        def __init__(self,rows): self.rows=rows
+        def fetchall(self): return self.rows
+        def one(self): return self.rows[0]
+    class Connection:
+        dialect=mysql.dialect()
+        def __enter__(self): return self
+        def __exit__(self,*args): pass
+        def execute(self,element): calls.append('DDL')
+        def commit(self): calls.append('COMMIT')
+        def exec_driver_sql(self,sql):
+            calls.append(sql)
+            if sql=='SHOW WARNINGS': return Result([('Warning',1681,'deprecated feature')])
+            assert sql.startswith('SHOW CREATE TABLE ')
+            return Result([(dst.name,'CREATE TABLE returned_by_mysql (id int)')])
+    class Target:
+        dialect=mysql.dialect()
+        def connect(self): return Connection()
+    class Inspector:
+        def has_table(self,name): return True
+    calls=[]
+    monkeypatch.setattr(migration.sa,'inspect',lambda conn:Inspector())
+    result=migration._create_object(Target(),CreateTable(dst),'table',dst,dst.name)
+    assert calls[:3]==['DDL','SHOW WARNINGS','COMMIT']
+    assert result['verified'] and 'returned_by_mysql' in result['mysql_ddl']
+    assert result['warnings'][0]['code']==1681
+
+
+def test_mysql_ddl_is_not_reported_successful_if_verification_fails(monkeypatch):
+    import migration
+    source,target,src,dst=pair()
+    class Inspector:
+        def has_table(self,name): return False
+    monkeypatch.setattr(migration.sa,'inspect',lambda conn:Inspector())
+    with pytest.raises(migration.MigrationError,match='não foi encontrado'):
+        migration._create_object(target,CreateTable(dst),'table',dst,dst.name)
+
+
+def test_existing_view_is_also_preserved_when_skipping():
+    source,target,src,dst=pair()
+    with target.begin() as conn: conn.exec_driver_sql('CREATE VIEW dbo__people AS SELECT 99 AS id')
+    src2,dst2=add_second_table(source);job={}
+    execute(source,target,{'pairs':[(src,dst),(src2,dst2)],'errors':[]},job,3,'skip',True)
+    assert job['status']=='completed_with_warnings' and job['rows']==1
+    with target.connect() as conn: assert conn.exec_driver_sql('SELECT id FROM dbo__people').scalar()==99
+
+
+def test_skip_policy_handles_table_created_after_preflight(monkeypatch):
+    import migration
+    source,target,src,dst=pair();src2,dst2=add_second_table(source)
+    original=migration._create_object
+    def concurrent_create(target,element,kind,table,name):
+        if name==dst.name:
+            dst.create(target)
+            raise sa.exc.OperationalError('hidden SQL',{},RuntimeError(1050,'table already exists'))
+        return original(target,element,kind,table,name)
+    monkeypatch.setattr(migration,'_create_object',concurrent_create)
+    job={};execute(source,target,{'pairs':[(src,dst),(src2,dst2)],'errors':[]},job,3,'skip',True)
+    assert job['status']=='completed_with_warnings' and job['rows']==1
+    assert not any(e['status']=='failed' for e in job['events'])
+    with target.connect() as conn: assert conn.scalar(sa.select(sa.func.count()).select_from(dst))==0

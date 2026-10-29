@@ -28,7 +28,7 @@ Os pacotes normalmente oferecem wheels. Caso não exista wheel para seu sistema/
 
 - SQL Server: habilite TCP/IP no SQL Server Configuration Manager, confirme a porta real da instância e use autenticação SQL Server. Instâncias nomeadas podem usar uma porta diferente de 1433: informe o host e a porta separados, sem `\\INSTANCIA` no campo servidor.
 - Conta de origem: SELECT nas tabelas escolhidas e VIEW DEFINITION para refletir objetos e ler definições. Visibilidade de catálogo depende das permissões. Objetos criptografados retornam definição nula. A aplicação só lê a origem.
-- MySQL: crie previamente um banco **exclusivo e vazio**. Use uma conta com CREATE, INSERT, SELECT, ALTER, INDEX e REFERENCES nesse banco. Exemplo de criação pelo administrador:
+- MySQL: crie previamente um banco **exclusivo para migração** (preferencialmente vazio). Use uma conta com CREATE, INSERT, SELECT, ALTER, INDEX e REFERENCES nesse banco. Exemplo de criação pelo administrador:
 
 ```sql
 CREATE DATABASE migracao CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
@@ -44,7 +44,7 @@ CREATE DATABASE migracao CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
 2. Clique em **Ler catálogo** e selecione as tabelas.
 3. Gere o plano. Revise tipos, nomes, DDL, bloqueios e avisos; baixe o ZIP com o plano e as definições originais.
 4. Pause as escritas na origem. Não há snapshot global, CDC nem sincronização incremental: mudanças concorrentes podem produzir uma cópia inconsistente entre tabelas.
-5. Digite **MIGRAR** e execute. O progresso informa linhas enviadas; o relatório confirma linhas efetivamente gravadas por tabela.
+5. Digite **MIGRAR** e execute. O progresso informa linhas confirmadas e linhas da transação em andamento; o relatório confirma linhas efetivamente gravadas por tabela.
 6. Baixe o relatório, valide contagens, valores e regras de negócio. A contagem do destino é comparada às linhas copiadas, sem checksum de conteúdo. Depois adapte e valide os objetos manuais antes de direcionar sua aplicação ao MySQL.
 
 ## Escopo automático
@@ -65,9 +65,30 @@ Defaults, IDENTITY/AUTO_INCREMENT, expressões de colunas calculadas e CHECKs n�
 
 Revise collation, comparação com espaços, acentos, maiúsculas e minúsculas, regras de UNIQUE com NULL, comprimento de índices, limite de linha do InnoDB, chaves sobre tipos TEXT/BLOB e diferenças de precisão temporal (MySQL até 6 casas; SQL Server até 7). Algumas incompatibilidades podem ser detectadas apenas na execução pelo MySQL; o plano não certifica equivalência de comportamento. A conexão SQL Server 2008 será validada no ambiente real.
 
-A aplicação **não apaga, trunca ou reutiliza tabelas existentes**. Se qualquer tabela planejada já existir, recusa a operação. DDL do MySQL faz commit implícito: uma falha pode deixar tabelas vazias ou parciais. Cada carga de tabela é uma transação; tabelas anteriores permanecem confirmadas. Índices e FKs são criados em seguida. Não existe retomada automática: após falha, inspecione o relatório e use um novo banco vazio ou remova manualmente apenas os objetos da tentativa anterior. Não mate o processo durante uma migração.
+## Controle da execução e retorno do MySQL
 
-Uso previsto: uma pessoa e uma migração por vez, na máquina local. Estado, plano, conexões e histórico ficam em memória e se perdem ao encerrar o processo. Baixe os relatórios antes de fechar. O serviço é limitado a 127.0.0.1, valida Host e usa proteção CSRF; não o exponha na rede como serviço multiusuário. Mensagens de drivers não são mostradas, pois podem conter SQL, credenciais ou dados de negócio. Falhas mostram etapa e classe do erro. Não há cancelamento nesta versão.
+Antes de executar, escolha a política para tabelas existentes:
+
+- **Interromper antes de criar objetos**: padrão conservador. Se houver conflito de nome com tabela ou view, nenhuma tabela nova é criada.
+- **Pular tabela existente e continuar**: preserva toda a estrutura e os dados da tabela existente. Não insere registros nela, não recria seus índices/FKs e não a considera validada. Isso permite migrar as demais tabelas, mas não retoma nem completa uma carga parcial.
+
+A inspeção do destino aparece no plano quando ele está conectado. A execução verifica novamente o catálogo, pois o destino pode mudar entre o plano e a carga.
+
+A opção **Continuar com os demais objetos após uma falha**, habilitada na interface, isola falhas de criação, carga, índices e FKs. Desmarque para interromper no primeiro erro. Falhas globais de catálogo/conexão inicial ou incompatibilidades bloqueantes do plano ainda impedem a execução.
+
+O acompanhamento lista cada operação como **criado e verificado**, **carga confirmada**, **pulado** ou **falhou**. Filtre para localizar falhas e pendências. Para DDL bem-sucedido, a aplicação confirma COMMIT, verifica o objeto no catálogo e, no MySQL, mostra o `SHOW CREATE TABLE` retornado pelo servidor após aquela operação. Não é um código numérico de sucesso: DDL MySQL normalmente não retorna linhas. Os avisos de `SHOW WARNINGS` também são registrados.
+
+Erros incluem etapa, objeto, classe, código do servidor quando disponível, referência e orientação. Exemplos: 1071 (índice longo), 1170 (índice sobre TEXT/BLOB sem prefixo), 1118 (limite de linha), 1062 (duplicidade), 1452 (registros órfãos), 3780 (tipos de FK incompatíveis), erros de permissão e de conexão. Essas orientações não substituem a revisão do esquema. Valores dos registros presentes em mensagens de erro da carga são omitidos.
+
+As cargas usam modo estrito no MySQL. Avisos durante INSERT interrompem e revertem a transação da tabela para evitar conversões/truncamentos silenciosos; os outros objetos podem continuar conforme a opção escolhida. As linhas no contador principal só entram após COMMIT da tabela; o contador em andamento ainda não está confirmado.
+
+Índices só são criados em tabelas cuja carga foi confirmada. FKs só são criadas quando ambas as tabelas foram carregadas nesta execução. Se uma tabela foi pulada ou falhou, a FK dependente fica **pulada com motivo**, para revisão manual. Não se presume que uma tabela existente contém o esquema ou os dados corretos. Isso evita alterar tabelas preservadas ou associar dados sem verificação.
+
+Estados finais: **concluído**, **concluído com pendências** (pulos/avisos), **concluído com erros** (falhas isoladas) e **interrompido**. Sempre revise também os avisos do plano e os objetos manuais, mesmo no estado concluído. O botão de relatório exporta JSON com opções, resultados, erros, contagens, horários, avisos do plano e DDL retornado; esse relatório permanece disponível mesmo após gerar outro plano.
+
+DDL do MySQL faz commit implícito: uma falha pode deixar tabelas vazias ou parciais. Cada carga de tabela é uma transação; tabelas anteriores permanecem confirmadas. Se houver perda de conexão no COMMIT, o resultado pode ser incerto: inspecione o destino antes de repetir. A aplicação nunca apaga ou trunca tabelas. Para repetir tabelas incompletas, use um banco novo ou remova manualmente apenas os artefatos da tentativa anterior após revisão. Não existe retomada automática nem cancelamento. Não mate o processo durante uma migração.
+
+Uso previsto: uma pessoa e uma migração por vez, na máquina local. Estado, plano, conexões e histórico ficam em memória e se perdem ao encerrar o processo. Baixe os relatórios antes de fechar. O serviço é limitado a 127.0.0.1, valida Host e usa proteção CSRF; não o exponha na rede como serviço multiusuário. Diagnósticos exibem mensagens dos drivers sem SQLAlchemy SQL/parâmetros e com ocultação de credenciais e valores de registros. Revise nomes de objetos antes de compartilhar relatórios. Não há cancelamento nesta versão.
 
 ## Testes
 

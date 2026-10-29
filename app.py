@@ -1,14 +1,14 @@
 import io
 import json
 import secrets
-import re
 import threading
 import zipfile
 from functools import wraps
 from flask import Flask, request, session, jsonify, render_template, send_file
 import sqlalchemy as sa
 from sqlalchemy.engine import URL
-from migration import inventory, plan, execute, PlanError
+from migration import inventory, plan, execute, PlanError, destination_objects
+from diagnostics import diagnostic
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
@@ -68,9 +68,9 @@ def connect(kind):
         state[kind] = engine
         state['plan'] = None
         return jsonify(ok=True)
-    except Exception:
+    except Exception as exc:
         if engine: engine.dispose()
-        return error('Não foi possível conectar. Confira endereço, porta, banco, credenciais, TLS e permissão de rede. O banco de destino precisa existir.')
+        return request_diagnostic(exc, 'Conectar ' + kind, engines=(engine,))
 
 
 @app.post('/api/inventory')
@@ -78,34 +78,21 @@ def connect(kind):
 def scan():
     if state['source'] is None: return error('Conecte a origem primeiro.')
     try: return jsonify(inventory(state['source']))
-    except Exception: return error('Falha na leitura do catálogo. Confira permissões de metadados (VIEW DEFINITION).')
+    except Exception as exc: return request_diagnostic(exc, 'Ler catálogo de origem', engines=(state['source'],))
 
+
+
+def request_diagnostic(exc, stage, object_name=None, engines=()):
+    detail = diagnostic(exc, stage, object_name, engines)
+    text = (f"Falha [{detail['reference']}]. Etapa: {stage}. Objeto: {object_name or 'catálogo'}. "
+            f"{detail['exception']} / {detail['driver_exception']}: {detail['message']} "
+            f"Orientação: {detail['hint']}")
+    app.logger.error('%s', text)
+    return jsonify(error=text, diagnostic=detail), 400
 
 
 def plan_diagnostic(exc):
-    cause = exc.cause
-    original = getattr(cause, 'orig', cause)
-    # Never stringify a SQLAlchemy DBAPIError: it includes SQL and parameters.
-    message = str(original)
-    if getattr(original, 'args', None):
-        message = ' | '.join(arg.decode('utf-8', errors='replace') if isinstance(arg, bytes) else str(arg) for arg in original.args)
-    engine = state['source']
-    url = getattr(engine, 'url', None)
-    for secret in (getattr(url, 'password', None), getattr(url, 'username', None)):
-        if secret:
-            message = message.replace(str(secret), '[oculto]')
-    message = re.sub(r'(?i)(?:mssql|mysql|https?)://[^\s]+', '[conexão oculta]', message)
-    message = re.sub(r'(?i)((?:password|pwd|senha)\s*[=:]\s*)([^;\s]+)', r'\1[oculto]', message)
-    message = message.split('[SQL:')[0].split('[parameters:')[0][:3000]
-    reference = secrets.token_hex(6)
-    detail = {'reference': reference, 'stage': exc.stage, 'object': exc.object_name,
-              'exception': type(cause).__name__, 'driver_exception': type(original).__name__,
-              'message': message or 'Exceção sem mensagem.'}
-    text = (f"Falha ao gerar plano [{reference}]. Etapa: {exc.stage}. "
-            f"Objeto: {exc.object_name or 'catálogo'}. "
-            f"{type(cause).__name__} / {type(original).__name__}: {detail['message']}")
-    app.logger.error('%s', text)
-    return jsonify(error=text, diagnostic=detail), 400
+    return request_diagnostic(exc.cause, exc.stage, exc.object_name, (state['source'], state['target']))
 
 
 @app.post('/api/plan')
@@ -118,7 +105,15 @@ def make_plan():
         if not isinstance(selected, list) or not all(isinstance(x, str) for x in selected): return error('Seleção inválida.')
         prepared = plan(state['source'], selected)
         prepared['id'] = secrets.token_urlsafe(24)
-        response = jsonify(id=prepared['id'], ddl=prepared['ddl'], warnings=prepared['warnings'], errors=prepared['errors'], objects=prepared['objects'], tables=[{'source': s.fullname, 'target': d.name, 'columns': [{'name': c.name, 'type': str(c.type.compile(dialect=sa.dialects.mysql.dialect()))} for c in d.columns]} for s,d in prepared['pairs']])
+        prepared['destination_check'] = []
+        if state['target'] is not None:
+            try:
+                existing = destination_objects(state['target'])
+                prepared['destination_check'] = [{'table': d.name, 'exists': d.name.casefold() in existing} for _, d in prepared['pairs']]
+            except Exception as exc:
+                detail = diagnostic(exc, 'Inspecionar destino', engines=(state['target'],))
+                prepared['warnings'].append(f"Não foi possível inspecionar o destino: {detail['message']}. A execução fará nova verificação.")
+        response = jsonify(destination_check=prepared['destination_check'], id=prepared['id'], ddl=prepared['ddl'], warnings=prepared['warnings'], errors=prepared['errors'], objects=prepared['objects'], tables=[{'source': s.fullname, 'target': d.name, 'columns': [{'name': c.name, 'type': str(c.type.compile(dialect=sa.dialects.mysql.dialect()))} for c in d.columns]} for s,d in prepared['pairs']])
         state['plan'] = prepared
         return response
     except PlanError as exc: return plan_diagnostic(exc)
@@ -137,14 +132,26 @@ def run():
     try: batch = int(data.get('batch', 1000))
     except (ValueError, TypeError): return error('Lote inválido.')
     if not 1 <= batch <= 10000: return error('O lote deve ter entre 1 e 10000 linhas.')
-    job = {'status': 'queued', 'rows': 0, 'logs': [], 'tables': [], 'stage': 'Preparando'}
+    existing_policy = data.get('existing_policy', 'abort')
+    continue_on_error = data.get('continue_on_error', True)
+    if existing_policy not in ('abort', 'skip'): return error('Política de objetos existentes inválida.')
+    if not isinstance(continue_on_error, bool): return error('Opção de continuar após erros deve ser booleana.')
+    job = {'plan_id': prepared['id'], 'plan_warnings': prepared.get('warnings', []), 'status': 'queued', 'rows': 0, 'logs': [], 'tables': [], 'stage': 'Preparando'}
     state['job'] = job
-    threading.Thread(target=execute, args=(state['source'], state['target'], prepared, job, batch), daemon=True).start()
+    threading.Thread(target=execute, args=(state['source'], state['target'], prepared, job, batch, existing_policy, continue_on_error), daemon=True).start()
     return jsonify(ok=True)
 
 
 @app.get('/api/job')
 def job_status(): return jsonify(state['job'] or {'status': 'idle'})
+
+
+@app.get('/api/report')
+def report():
+    if not session.get('csrf'): return error('Abra a página primeiro.', 403)
+    if not state['job']: return error('Nenhuma execução disponível.')
+    content = json.dumps(state['job'], ensure_ascii=False, indent=2).encode('utf-8')
+    return send_file(io.BytesIO(content), mimetype='application/json', as_attachment=True, download_name='sqlbridge-execucao.json')
 
 
 @app.get('/api/export')
@@ -158,7 +165,7 @@ def export():
         with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as archive:
             archive.writestr('mysql-plan.sql', prepared['ddl'])
             archive.writestr('objetos-origem.json', json.dumps(prepared['objects'], ensure_ascii=False, indent=2))
-            archive.writestr('revisao.json', json.dumps({'warnings': prepared['warnings'], 'errors': prepared['errors'], 'job': state['job']}, ensure_ascii=False, indent=2))
+            archive.writestr('revisao.json', json.dumps({'warnings': prepared['warnings'], 'errors': prepared['errors'], 'job': state['job'] if state['job'] and state['job'].get('plan_id') == prepared['id'] else None}, ensure_ascii=False, indent=2))
         buffer.seek(0)
         return send_file(buffer, mimetype='application/zip', as_attachment=True, download_name='sqlbridge-plano.zip')
 

@@ -1,5 +1,6 @@
 """SQL Server inventory and conservative MySQL migration planner."""
 import hashlib
+from diagnostics import diagnostic
 from datetime import datetime, timezone
 import sqlalchemy as sa
 from sqlalchemy.dialects import mysql
@@ -140,13 +141,20 @@ def _plan(engine, selected, context):
     warnings.append('Views, procedures, funções, triggers, sequences e synonyms são exportados para revisão; não executados automaticamente.')
     dialect = mysql.dialect()
     statements = []
+    def compile_ddl(element, stage, name):
+        context.update(stage=stage, object=name)
+        try:
+            statements.append(str(element.compile(dialect=dialect))+';')
+        except sa.exc.CompileError as exc:
+            detail = diagnostic(exc, stage, name)
+            errors.append(f"{name}: {stage}: {detail['message']}")
     for src, d in pairs:
-        context.update(stage='Compilar CREATE TABLE para MySQL', object=src.fullname)
-        statements.append(str(CreateTable(d).compile(dialect=dialect))+';')
+        compile_ddl(CreateTable(d), 'Compilar CREATE TABLE para MySQL', src.fullname)
     for src, d in pairs:
-        context.update(stage='Compilar índices e FKs para MySQL', object=src.fullname)
-        statements += [str(CreateIndex(i).compile(dialect=dialect))+';' for i in d.indexes]
-        statements += [str(AddConstraint(f).compile(dialect=dialect))+';' for f in d.foreign_key_constraints]
+        for index in sorted(d.indexes, key=lambda i: i.name):
+            compile_ddl(CreateIndex(index), 'Compilar índice para MySQL', index.name)
+        for fk in sorted(d.foreign_key_constraints, key=lambda f: f.name):
+            compile_ddl(AddConstraint(fk), 'Compilar FK para MySQL', fk.name)
     return {'pairs': pairs, 'ddl': '\n\n'.join(statements), 'warnings': warnings, 'errors': errors, 'objects': catalog['objects']}
 
 
@@ -154,48 +162,165 @@ class MigrationError(Exception):
     pass
 
 
-def execute(source, target, prepared, job, batch):
-    """Never drops, truncates or reuses destination tables. MySQL DDL auto-commits."""
-    job.update(status='running', rows=0, logs=[], tables=[])
+def destination_objects(target):
+    inspector = sa.inspect(target)
+    return {name.casefold() for name in inspector.get_table_names() + inspector.get_view_names()}
+
+
+def _create_object(target, element, kind, table, name):
+    """Return server warnings and metadata verification after committed DDL."""
+    result = {'message': 'DDL executado; COMMIT confirmado.', 'warnings': []}
+    with target.connect() as conn:
+        conn.execute(element)
+        if target.dialect.name == 'mysql':
+            # SHOW WARNINGS must immediately follow the DDL on the same session.
+            result['warnings'] = [diagnostic(RuntimeError(int(r[1]), r[2]), 'Aviso MySQL', name,
+                                            (target,), hide_values=True) for r in conn.exec_driver_sql('SHOW WARNINGS').fetchall()]
+        conn.commit()
+        inspector = sa.inspect(conn)
+        if kind == 'table':
+            found = inspector.has_table(table.name)
+            if found and target.dialect.name == 'mysql':
+                quoted = conn.dialect.identifier_preparer.quote(table.name)
+                result['mysql_ddl'] = str(conn.exec_driver_sql(f'SHOW CREATE TABLE {quoted}').one()[1])
+        elif kind == 'index':
+            found = any(item['name'] == name for item in inspector.get_indexes(table.name))
+        else:
+            found = any(item['name'] == name for item in inspector.get_foreign_keys(table.name))
+        if found and target.dialect.name == 'mysql' and kind != 'table':
+            quoted = conn.dialect.identifier_preparer.quote(table.name)
+            result['mysql_ddl'] = str(conn.exec_driver_sql(f'SHOW CREATE TABLE {quoted}').one()[1])
+        if not found: raise MigrationError('DDL confirmado, mas o objeto não foi encontrado no catálogo. Inspecione o destino antes de repetir.')
+    result['verified'] = True
+    result['message'] += ' Objeto confirmado no catálogo do destino.'
+    return result
+
+
+def execute(source, target, prepared, job, batch, existing_policy='abort', continue_on_error=False):
+    """Never modifies existing tables. Independent failures may be isolated."""
+    job.update(status='running', rows=0, rows_in_flight=0, logs=[], tables=[], events=[],
+               options={'existing_policy': existing_policy, 'continue_on_error': continue_on_error},
+               started_at=datetime.now(timezone.utc).isoformat())
     pairs = prepared['pairs']
+    created, loaded = set(), set()
+
+    def record(kind, name, table, status, message, **extra):
+        entry = dict(kind=kind, object=name, table=table, status=status, message=message,
+                     at=datetime.now(timezone.utc).isoformat(), **extra)
+        job['events'].append(entry)
+        job['logs'].append(f'{status.upper()} · {kind} · {name}: {message}')
+        return entry
+
+    def failure(exc, kind, name, table):
+        detail = diagnostic(exc, job['stage'], name, (source, target), hide_values=True)
+        record(kind, name, table, 'failed', detail['message'], diagnostic=detail)
+        if not continue_on_error: raise MigrationError(f"{kind} {name}: {detail['category']}. {detail['hint']}") from exc
+
     try:
-        if prepared['errors']: raise MigrationError('Plano contém tipos não suportados.')
-        existing = {name.casefold() for name in sa.inspect(target).get_table_names()}
-        if any(d.name.casefold() in existing for _, d in pairs): raise MigrationError('Tabela de destino já existe. Use um banco vazio ou remova manualmente apenas os artefatos de uma tentativa anterior.')
-        # Create ALL tables before copying. No foreign keys until data is loaded.
-        with target.connect() as out:
-            for _, dst in pairs:
-                job['stage'] = f'Criando {dst.name}'
-                out.execute(CreateTable(dst)); out.commit()
-        with source.connect().execution_options(stream_results=True) as inc:
-            for src, dst in pairs:
-                job['stage'] = f'Copiando {src.fullname}'
-                copied = 0
-                with target.begin() as out:
+        if existing_policy not in ('abort', 'skip'): raise MigrationError('Política de objetos existentes inválida.')
+        if prepared['errors']: raise MigrationError('Plano contém incompatibilidades bloqueantes; revise antes de executar.')
+        job['stage'] = 'Verificar objetos existentes no destino'
+        existing = destination_objects(target)
+        if existing_policy == 'abort' and any(d.name.casefold() in existing for _, d in pairs):
+            for _, d in pairs:
+                if d.name.casefold() in existing:
+                    record('table', d.name, d.name, 'failed', 'Já existe no destino. A política escolhida exige interromper antes de criar objetos.')
+            raise MigrationError('Tabela de destino já existe. Escolha pular tabelas existentes ou use outro banco.')
+        for _, dst in pairs:
+            if dst.name.casefold() in existing:
+                record('table', dst.name, dst.name, 'skipped', 'Já existe no destino; estrutura, dados, índices e FKs preservados. Conteúdo não validado.')
+                continue
+            job['stage'] = f'Criar tabela {dst.name}'
+            try:
+                result = _create_object(target, CreateTable(dst), 'table', dst, dst.name)
+                created.add(dst.name)
+                record('table', dst.name, dst.name, 'created', result.pop('message'), **result)
+            except Exception as exc:
+                original = getattr(exc, 'orig', exc)
+                args = getattr(original, 'args', ())
+                if existing_policy == 'skip' and args and args[0] == 1050:
+                    record('table', dst.name, dst.name, 'skipped', 'Objeto passou a existir após a inspeção. Preservado sem carga nem alterações.')
+                else:
+                    failure(exc, 'table', dst.name, dst.name)
+        for src, dst in pairs:
+            if dst.name not in created:
+                record('data', dst.name, dst.name, 'skipped', 'Carga omitida: tabela não criada e verificada nesta execução.')
+                continue
+            job['stage'] = f'Copiar dados de {src.fullname}'
+            copied = 0
+            try:
+                with source.connect().execution_options(stream_results=True) as inc, target.begin() as out:
+                    # Reject silent conversion/truncation rather than reporting corrupted data as success.
+                    if target.dialect.name == 'mysql':
+                        mode = out.exec_driver_sql('SELECT @@SESSION.sql_mode').scalar() or ''
+                        modes = set(mode.split(',')) - {''}
+                        modes.add('STRICT_ALL_TABLES')
+                        out.exec_driver_sql('SET SESSION sql_mode = %s', (','.join(sorted(modes)),))
                     result = inc.execute(sa.select(src))
-                    while True:
-                        rows = result.fetchmany(batch)
-                        if not rows: break
-                        payload = []
-                        for row in rows:
-                            entry = dict(row._mapping)
-                            for col in src.columns:
-                                if entry[col.name] is not None and type(col.type).__name__.upper() in ('UNIQUEIDENTIFIER', 'UUID'): entry[col.name] = str(entry[col.name])
-                            payload.append(entry)
-                        out.execute(dst.insert(), payload)
-                        copied += len(rows); job['rows'] += len(rows)
+                    try:
+                        while True:
+                            rows = result.fetchmany(batch)
+                            if not rows: break
+                            payload = []
+                            for row in rows:
+                                entry = dict(row._mapping)
+                                for col in src.columns:
+                                    if entry[col.name] is not None and type(col.type).__name__.upper() in ('UNIQUEIDENTIFIER', 'UUID'):
+                                        entry[col.name] = str(entry[col.name])
+                                payload.append(entry)
+                            out.execute(dst.insert(), payload)
+                            if target.dialect.name == 'mysql':
+                                warnings = out.exec_driver_sql('SHOW WARNINGS').fetchall()
+                                if warnings:
+                                    code = int(warnings[0][1])
+                                    raise RuntimeError(code, 'Aviso durante INSERT; transação revertida para evitar conversão silenciosa.')
+                            copied += len(rows)
+                            job['rows_in_flight'] = copied
+                    finally:
+                        result.close()
                     actual = out.scalar(sa.select(sa.func.count()).select_from(dst))
-                    if actual != copied: raise ValueError('Contagem de destino divergente.')
+                    if actual != copied: raise MigrationError('Contagem de destino divergente; transação revertida.')
+                loaded.add(dst.name)
+                job['rows'] += copied
                 job['tables'].append({'source': src.fullname, 'target': dst.name, 'copied': copied, 'target_count': actual})
-                job['logs'].append(f'{src.fullname}: {copied} registros confirmados.')
-        job['stage'] = 'Criando índices e relacionamentos'
-        with target.connect() as out:
-            for _, dst in pairs:
-                for index in dst.indexes: index.create(out); out.commit()
-                for fk in dst.foreign_key_constraints: out.execute(AddConstraint(fk)); out.commit()
-        job.update(status='completed', stage='Concluído; revise os objetos manuais e valide a aplicação.')
+                record('data', dst.name, dst.name, 'copied', f'{copied} registros confirmados; contagem do destino: {actual}.', rows=copied)
+            except Exception as exc: failure(exc, 'data', dst.name, dst.name)
+            finally: job['rows_in_flight'] = 0
+        for _, dst in pairs:
+            for index in sorted(dst.indexes, key=lambda i: i.name):
+                if dst.name not in loaded:
+                    record('index', index.name, dst.name, 'skipped', 'Tabela sem carga confirmada nesta execução.'); continue
+                job['stage'] = f'Criar índice {index.name}'
+                try:
+                    result = _create_object(target, CreateIndex(index), 'index', dst, index.name)
+                    record('index', index.name, dst.name, 'created', result.pop('message'), **result)
+                except Exception as exc: failure(exc, 'index', index.name, dst.name)
+        for _, dst in pairs:
+            for fk in sorted(dst.foreign_key_constraints, key=lambda f: f.name):
+                references = {element.column.table.name for element in fk.elements}
+                if dst.name not in loaded or not references.issubset(loaded):
+                    record('foreign_key', fk.name, dst.name, 'skipped', 'FK omitida: tabela dependente ou referenciada pulada/sem carga confirmada. Revisão manual necessária.'); continue
+                job['stage'] = f'Criar chave estrangeira {fk.name}'
+                try:
+                    result = _create_object(target, AddConstraint(fk), 'foreign_key', dst, fk.name)
+                    record('foreign_key', fk.name, dst.name, 'created', result.pop('message'), **result)
+                except Exception as exc: failure(exc, 'foreign_key', fk.name, dst.name)
+        has_errors = any(e['status'] == 'failed' for e in job['events'])
+        has_warnings = any(e['status'] == 'skipped' or e.get('warnings') for e in job['events'])
+        status = 'completed_with_errors' if has_errors else 'completed_with_warnings' if has_warnings else 'completed'
+        job.update(status=status, stage='Processamento encerrado. Confira resultados por objeto e pendências manuais.')
     except Exception as exc:
-        # Do not expose driver messages, SQL parameters or migrated records.
-        job.update(status='failed', stage='Migração interrompida', error=str(exc) if isinstance(exc, MigrationError) else f'{type(exc).__name__}: falha em {job.get("stage", "preparação")}. Confira compatibilidade, dados e tabelas parciais; a operação não remove tabelas preexistentes.')
+        detail = diagnostic(exc, job.get('stage', 'Preparação'), None, (source, target), hide_values=True)
+        if not any(e['status'] == 'failed' for e in job['events']):
+            record('execution', job.get('stage', 'Preparação'), '', 'failed', detail['message'], diagnostic=detail)
+        job.update(status='failed', error=detail['message'], diagnostic=detail, stage='Migração interrompida; confira o relatório.')
     finally:
+        if job['status'] == 'failed':
+            attempted = {(e['kind'], e['table'], e['object']) for e in job['events']}
+            for _, dst in pairs:
+                pending = [('table', dst.name), ('data', dst.name)] + [('index', i.name) for i in dst.indexes] + [('foreign_key', f.name) for f in dst.foreign_key_constraints]
+                for kind, name in pending:
+                    if (kind, dst.name, name) not in attempted:
+                        record(kind, name, dst.name, 'skipped', 'Não executado: processamento interrompido. Verifique o destino antes de repetir.')
+        job['summary'] = {status: sum(e['status'] == status for e in job['events']) for status in ('created', 'copied', 'skipped', 'failed')}
         job['finished_at'] = datetime.now(timezone.utc).isoformat()
