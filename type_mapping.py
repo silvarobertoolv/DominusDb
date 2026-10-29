@@ -1,6 +1,7 @@
 """Parse a bounded MySQL type vocabulary; never accept arbitrary DDL."""
 import re
-from sqlalchemy.dialects import mysql
+from sqlalchemy.dialects import mysql, postgresql, oracle
+import sqlalchemy as sa
 
 TYPE_EXAMPLES = ['BIGINT', 'INT', 'SMALLINT', 'TINYINT', 'BIGINT UNSIGNED', 'BOOLEAN',
                  'DECIMAL(18,2)', 'DOUBLE', 'FLOAT', 'VARCHAR(255)', 'CHAR(36)',
@@ -8,7 +9,8 @@ TYPE_EXAMPLES = ['BIGINT', 'INT', 'SMALLINT', 'TINYINT', 'BIGINT UNSIGNED', 'BOO
                  'BLOB', 'MEDIUMBLOB', 'LONGBLOB', 'DATE', 'DATETIME(6)', 'TIME(6)']
 
 
-def parse_target_type(value):
+def parse_target_type(value, kind="mysql"):
+    if kind != "mysql": return parse_native_type(value, kind)
     if not isinstance(value, str) or len(value) > 80:
         raise ValueError('Informe um tipo MySQL válido.')
     match = re.fullmatch(r'\s*([A-Za-z]+)\s*(?:\(\s*(\d{1,5})\s*(?:,\s*(\d{1,5})\s*)?\))?\s*(UNSIGNED)?\s*', value, re.I)
@@ -44,3 +46,47 @@ def validate_overrides(overrides):
             # Individual invalid types stay in the editable plan as column errors.
             if not isinstance(value, str): raise ValueError('Tipo de destino deve ser texto.')
     return overrides
+
+
+TYPE_EXAMPLES_BY_KIND = {
+    'mysql': TYPE_EXAMPLES,
+    'postgresql': ['BIGINT','INTEGER','SMALLINT','BOOLEAN','NUMERIC(38,10)','DOUBLE PRECISION','VARCHAR(255)','TEXT','UUID','BYTEA','DATE','TIME(6)','TIMESTAMP(6)','TIMESTAMP(6) WITH TIME ZONE'],
+    'oracle': ['NUMBER(19,0)','NUMBER(38,10)','BINARY_DOUBLE','NVARCHAR2(255)','VARCHAR2(255)','NCLOB','CLOB','RAW(16)','BLOB','DATE','TIMESTAMP(6)','TIMESTAMP(6) WITH TIME ZONE','INTERVAL DAY TO SECOND'],
+}
+
+
+def parse_native_type(value,kind):
+    if kind not in ('postgresql','oracle') or not isinstance(value,str) or len(value)>80:raise ValueError('Tipo de destino inválido.')
+    normalized=' '.join(value.upper().split())
+    if normalized=='DOUBLE PRECISION' and kind=='postgresql':return postgresql.DOUBLE_PRECISION()
+    if normalized in ('INTERVAL DAY TO SECOND','INTERVAL DAY(1) TO SECOND(6)') and kind=='oracle':return oracle.INTERVAL(day_precision=1,second_precision=6)
+    match=re.fullmatch(r'([A-Z0-9_]+)\s*(?:\(\s*(\d{1,5})\s*(?:,\s*(\d{1,5})\s*)?\))?\s*(WITH(?:OUT)? TIME ZONE)?',normalized)
+    if not match:raise ValueError('Informe somente um tipo suportado e seus parâmetros; SQL arbitrário não é permitido.')
+    name,first,second,tz=match.groups()
+    args=[int(x) for x in (first,second) if x is not None]
+    if tz and name not in ('TIME','TIMESTAMP'):raise ValueError('WITH TIME ZONE exige TIME/TIMESTAMP.')
+    if kind=='postgresql':
+        if name in ('TIMESTAMP','TIME') and len(args)<=1 and (not args or args[0]<=6):return getattr(postgresql,name)(precision=args[0] if args else 6,timezone=tz=='WITH TIME ZONE')
+        if tz:raise ValueError('Tipo temporal inválido.')
+        if name in ('NUMERIC','DECIMAL') and 1<=len(args)<=2:
+            p,s=args[0],args[1] if len(args)==2 else 0
+            if 1<=p<=1000 and 0<=s<=p:return sa.Numeric(p,s)
+        if name in ('VARCHAR','CHAR') and len(args)==1 and 1<=args[0]<=10485760:return getattr(sa,'String' if name=='VARCHAR' else 'CHAR')(args[0])
+        types={'INT':sa.Integer,'INTEGER':sa.Integer,'BIGINT':sa.BigInteger,'SMALLINT':sa.SmallInteger,'BOOLEAN':sa.Boolean,'TEXT':sa.Text,'BYTEA':postgresql.BYTEA,'UUID':lambda:postgresql.UUID(as_uuid=False),'DATE':sa.Date,'DOUBLE':postgresql.DOUBLE_PRECISION,'REAL':sa.REAL}
+        if name in types and not args:return types[name]()
+    else:
+        if name=='TIMESTAMP' and (not args or args==[6]):
+            from target_profiles import OracleTimestampTZ
+            return OracleTimestampTZ() if tz=='WITH TIME ZONE' else oracle.TIMESTAMP()
+        if tz:raise ValueError('Oracle neste perfil suporta TIMESTAMP(6) WITH TIME ZONE.')
+        if name in ('NUMBER','NUMERIC','DECIMAL'):
+            if not args and name=='NUMBER':return oracle.NUMBER()
+            if 1<=len(args)<=2:
+                p,s=args[0],args[1] if len(args)==2 else 0
+                if 1<=p<=38 and 0<=s<=127:return oracle.NUMBER(p,s)
+        if name in ('VARCHAR2','NVARCHAR2','RAW') and len(args)==1:
+            cap={'VARCHAR2':1000,'NVARCHAR2':1000,'RAW':2000}[name]
+            if 1<=args[0]<=cap:return getattr(oracle,name)(args[0])
+        types={'CLOB':oracle.CLOB,'NCLOB':oracle.NCLOB,'BLOB':oracle.BLOB,'DATE':oracle.DATE,'BINARY_DOUBLE':oracle.BINARY_DOUBLE,'BINARY_FLOAT':oracle.BINARY_FLOAT}
+        if name in types and not args:return types[name]()
+    raise ValueError('Tipo/parâmetros incompatíveis com o destino selecionado. Use as sugestões do perfil.')

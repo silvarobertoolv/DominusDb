@@ -7,10 +7,11 @@ import zipfile
 from functools import wraps
 from flask import Flask, request, session, jsonify, render_template, send_file
 import sqlalchemy as sa
-from sqlalchemy.engine import URL
+from connections import engine_for
+from target_profiles import destination_kind, destination_schema, dialect_for, KINDS
 from migration import inventory, plan, execute, PlanError, destination_objects
 from diagnostics import diagnostic
-from type_mapping import TYPE_EXAMPLES
+from type_mapping import TYPE_EXAMPLES_BY_KIND
 from transfer import TransferControl, WarningTrackingCursor
 
 app = Flask(__name__)
@@ -38,22 +39,6 @@ def idle(fn):
     return wrapped
 
 
-def engine_for(data, kind):
-    port = int(data.get('port') or (1433 if kind == 'source' else 3306))
-    if not 1 <= port <= 65535: raise ValueError('Porta inválida.')
-    query_timeout = int(data.get('query_timeout') or 300)
-    if not 10 <= query_timeout <= 3600: raise ValueError('Timeout deve ser entre 10 e 3600 segundos.')
-    for key in ('host', 'database', 'user'):
-        if not isinstance(data.get(key), str) or not data[key].strip(): raise ValueError(f'Preencha {key}.')
-    url = URL.create('mssql+pymssql' if kind == 'source' else 'mysql+pymysql', username=data['user'], password=data.get('password', ''), host=data['host'].strip(), port=port, database=data['database'])
-    args = {'login_timeout': 10, 'timeout': query_timeout, 'charset': 'UTF-8', 'encryption': 'require' if data.get('tls', True) else 'off', 'tds_version': '7.3', 'use_datetime2': True} if kind == 'source' else {'connect_timeout': 10, 'read_timeout': query_timeout, 'write_timeout': query_timeout, 'charset': 'utf8mb4', 'cursorclass': WarningTrackingCursor}
-    if kind == 'target' and data.get('tls'):
-        args['ssl'] = {'check_hostname': True}
-        args['ssl_verify_cert'] = True
-        args['ssl_verify_identity'] = True
-    return sa.create_engine(url, connect_args=args, pool_pre_ping=True, hide_parameters=True, echo=False)
-
-
 @app.get('/')
 def home():
     session.setdefault('csrf', secrets.token_urlsafe(32))
@@ -68,11 +53,11 @@ def connect(kind):
     try:
         engine = engine_for(request.get_json() or {}, kind)
         with engine.connect() as conn:
-            conn.execute(sa.text('SELECT 1'))
+            conn.execute(sa.text('SELECT 1 FROM DUAL' if engine.dialect.name == 'oracle' else 'SELECT 1'))
         if state[kind]: state[kind].dispose()
         state[kind] = engine
         state['plan'] = None
-        return jsonify(ok=True)
+        return jsonify(ok=True, target_kind=engine.dialect.name, target_schema=getattr(engine,'_sqlbridge_schema',None))
     except Exception as exc:
         if engine: engine.dispose()
         return request_diagnostic(exc, 'Conectar ' + kind, engines=(engine,))
@@ -108,7 +93,7 @@ def make_plan():
     try:
         selected = (request.get_json() or {}).get('tables')
         if not isinstance(selected, list) or not all(isinstance(x, str) for x in selected): return error('Seleção inválida.')
-        prepared = plan(state['source'], selected, state['target'], (request.get_json() or {}).get('overrides'))
+        prepared = plan(state['source'], selected, state['target'], (request.get_json() or {}).get('overrides'), (request.get_json() or {}).get('target_kind'))
         prepared['id'] = secrets.token_urlsafe(24)
         prepared['destination_check'] = []
         if state['target'] is not None:
@@ -118,7 +103,7 @@ def make_plan():
             except Exception as exc:
                 detail = diagnostic(exc, 'Inspecionar destino', engines=(state['target'],))
                 prepared['warnings'].append(f"Não foi possível inspecionar o destino: {detail['message']}. A execução fará nova verificação.")
-        response = jsonify(type_examples=TYPE_EXAMPLES, column_mappings=prepared.get('column_mappings', []), manual_mappings=prepared.get('manual_mappings', {}), compatibility=prepared.get('compatibility'), destination_check=prepared['destination_check'], id=prepared['id'], ddl=prepared['ddl'], warnings=prepared['warnings'], errors=prepared['errors'], objects=prepared['objects'], tables=[{'source': s.fullname, 'target': d.name, 'columns': [{'name': c.name, 'type': str(c.type.compile(dialect=sa.dialects.mysql.dialect()))} for c in d.columns]} for s,d in prepared['pairs']])
+        response = jsonify(target_kind=prepared.get('target_kind','mysql'), target_schema=prepared.get('target_schema'), type_examples=TYPE_EXAMPLES_BY_KIND[prepared.get('target_kind','mysql')], column_mappings=prepared.get('column_mappings', []), manual_mappings=prepared.get('manual_mappings', {}), compatibility=prepared.get('compatibility'), destination_check=prepared['destination_check'], id=prepared['id'], ddl=prepared['ddl'], warnings=prepared['warnings'], errors=prepared['errors'], objects=prepared['objects'], tables=[{'source': s.fullname, 'target': d.name, 'columns': [{'name': c.name, 'type': str(c.type.compile(dialect=dialect_for(prepared.get('target_kind','mysql'))))} for c in d.columns]} for s,d in prepared['pairs']])
         state['plan'] = prepared
         return response
     except PlanError as exc: return plan_diagnostic(exc)
@@ -150,7 +135,7 @@ def run():
     if isinstance(max_batch_mb, bool) or not isinstance(max_batch_mb, int) or not 1 <= max_batch_mb <= 64: return error('Limite do lote deve ser entre 1 e 64 MiB.')
     options = dict(transaction_mode=transaction_mode, verify_count=verify_count, max_batch_mb=max_batch_mb)
     control = TransferControl(batch)
-    job = {'id': secrets.token_hex(12), 'control_history': [], 'plan_id': prepared['id'], 'plan_warnings': prepared.get('warnings', []), 'compatibility': prepared.get('compatibility'), 'manual_mappings': prepared.get('manual_mappings', {}), 'status': 'queued', 'rows': 0, 'logs': [], 'tables': [], 'stage': 'Preparando'}
+    job = {'id': secrets.token_hex(12), 'control_history': [], 'target_kind': prepared.get('target_kind','mysql'), 'target_schema': prepared.get('target_schema'), 'plan_id': prepared['id'], 'plan_warnings': prepared.get('warnings', []), 'compatibility': prepared.get('compatibility'), 'manual_mappings': prepared.get('manual_mappings', {}), 'status': 'queued', 'rows': 0, 'logs': [], 'tables': [], 'stage': 'Preparando'}
     state['job'] = job
     state['control'] = control
     threading.Thread(target=execute, args=(state['source'], state['target'], prepared, job, batch, existing_policy, continue_on_error, options, control), daemon=True).start()
@@ -165,7 +150,7 @@ def job_status():
     except ValueError: return error('Cursor inválido.')
     if after < 0: return error('Cursor inválido.')
     # Keep large schema dictionaries and repeated SHOW CREATE responses out of polling.
-    fields = ('id', 'status', 'stage', 'activity', 'activity_started_at', 'rows', 'rows_in_flight',
+    fields = ('target_kind', 'target_schema', 'id', 'status', 'stage', 'activity', 'activity_started_at', 'rows', 'rows_in_flight',
               'table_progress', 'started_at', 'finished_at', 'summary', 'error', 'diagnostic', 'options')
     result = {k: job[k] for k in fields if k in job}
     events = list(job.get('events', []))
@@ -223,7 +208,7 @@ def export():
         if not prepared: return error('Gere um plano primeiro.')
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr('mysql-plan.sql', prepared['ddl'])
+            archive.writestr(prepared.get('target_kind','mysql')+'-plan.sql', prepared['ddl'])
             archive.writestr('compatibilidade.json', json.dumps(prepared.get('compatibility'), ensure_ascii=False, indent=2))
             archive.writestr('objetos-origem.json', json.dumps(prepared['objects'], ensure_ascii=False, indent=2))
             archive.writestr('revisao.json', json.dumps({'warnings': prepared['warnings'], 'errors': prepared['errors'], 'job': state['job'] if state['job'] and state['job'].get('plan_id') == prepared['id'] else None}, ensure_ascii=False, indent=2))

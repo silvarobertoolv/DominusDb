@@ -1,9 +1,9 @@
 """SQL Server inventory and conservative MySQL migration planner."""
-import hashlib
 from diagnostics import diagnostic
 from type_mapping import parse_target_type, validate_overrides
 from transfer import copy_table, TransferControl, MigrationCancelled, activity
-from compatibility import target_limits, source_dictionary, check_and_adapt
+from compatibility import source_dictionary
+from target_profiles import destination_kind, destination_schema, dialect_for, identifier, convert_native_type, target_limits, check_and_adapt, KINDS
 from datetime import datetime, timezone
 import sqlalchemy as sa
 from sqlalchemy.dialects import mysql, mssql
@@ -11,11 +11,10 @@ from sqlalchemy.schema import CreateTable, AddConstraint, CreateIndex
 
 
 def target_name(schema, name):
-    raw = f'{schema}__{name}'
-    return raw if len(raw) <= 64 else raw[:51] + '_' + hashlib.sha256(raw.encode()).hexdigest()[:12]
+    return identifier(schema, name, 'mysql')
 
-
-def convert_type(t):
+def convert_type(t, kind="mysql"):
+    if kind != "mysql": return convert_native_type(t, kind)
     name = type(t).__name__.upper()
     name = {'BIGINTEGER': 'BIGINT', 'SMALLINTEGER': 'SMALLINT', 'DOUBLE_PRECISION': 'DOUBLE'}.get(name, name)
     if name in ('TINYINT', 'SMALLINT', 'INTEGER', 'INT', 'BIGINT'):
@@ -91,15 +90,20 @@ class PlanError(Exception):
         super().__init__(f'{stage}: {type(cause).__name__}')
 
 
-def plan(engine, selected, target=None, overrides=None):
+def plan(engine, selected, target=None, overrides=None, target_kind=None):
     context = {'stage': 'Ler catálogo', 'object': None}
     try:
-        return _plan(engine, selected, context, target, validate_overrides(overrides))
+        return _plan(engine, selected, context, target, validate_overrides(overrides), target_kind)
     except Exception as exc:
         raise PlanError(context['stage'], context['object'], exc) from exc
 
 
-def _plan(engine, selected, context, target=None, overrides=None):
+def _plan(engine, selected, context, target=None, overrides=None, target_kind=None):
+    kind = destination_kind(target, target_kind)
+    label = KINDS[kind]
+    dialect = dialect_for(kind)
+    schema = destination_schema(target, kind)
+    def named(a, b): return identifier(a, b, kind)
     catalog = inventory(engine)
     available = {t['id']: t for t in catalog['tables']}
     if not selected or len(selected) != len(set(selected)) or any(x not in available for x in selected):
@@ -112,7 +116,7 @@ def _plan(engine, selected, context, target=None, overrides=None):
     destination = sa.MetaData()
     pairs, warnings, errors = [], [], []
     dictionary = []
-    limits, limit_warnings = target_limits(target)
+    limits, limit_warnings = target_limits(target, kind)
     warnings.extend(limit_warnings)
     for key in selected:
         item = available[key]
@@ -137,13 +141,15 @@ def _plan(engine, selected, context, target=None, overrides=None):
             resolved_type = dictionary_type(col, definitions_by_name.get(col.name, {}))
             try:
                 try:
-                    automatic = convert_type(resolved_type)
-                    entry['automatic_type'] = str(automatic.compile(dialect=mysql.dialect()))
+                    automatic = convert_type(resolved_type, kind)
+                    entry['automatic_type'] = str(automatic.compile(dialect=dialect))
                 except ValueError:
                     if manual is None: raise
-                if len(col.name) > 64: raise ValueError('nome de coluna excede o limite de 64 caracteres do MySQL')
-                typ = parse_target_type(manual) if manual is not None else automatic
-                entry['target_type'] = str(typ.compile(dialect=mysql.dialect()))
+                if len(col.name.encode('utf-8')) > limits['identifier_bytes']: raise ValueError(f'nome da coluna excede o limite de {limits["identifier_bytes"]} bytes do perfil {label}')
+                if kind == 'postgresql' and col.name in ('ctid','xmin','xmax','cmin','cmax','tableoid'): raise ValueError('nome conflita com coluna de sistema PostgreSQL; renomeação da origem necessária')
+                if kind == 'oracle' and col.name == 'ROWID': raise ValueError('ROWID em maiúsculas é reservado pelo Oracle; renomeação da origem necessária')
+                typ = parse_target_type(manual, kind) if manual is not None else automatic
+                entry['target_type'] = str(typ.compile(dialect=dialect))
                 columns.append(sa.Column(col.name, typ, nullable=False if col.name in pk else col.nullable,
                                          primary_key=col.name in pk, autoincrement=False,
                                          info={'manual_type': manual is not None}))
@@ -151,15 +157,18 @@ def _plan(engine, selected, context, target=None, overrides=None):
                     warnings.append(f'{key}.{col.name}: tipo escolhido manualmente: {entry["target_type"]}. Revise a compatibilidade dos valores; a escolha não transforma os dados de origem.')
                 if any(value is not None for value in (col.default, col.server_default, col.computed, col.identity)):
                     warnings.append(f'{key}.{col.name}: valor copiado; default, cálculo ou identity não recriados.')
-                if type(resolved_type).__name__.upper() in ('DATETIME2', 'TIME'):
-                    warnings.append(f'{key}.{col.name}: MySQL preserva até 6 casas de segundo; SQL Server pode ter 7.')
+                if type(resolved_type).__name__.upper() == 'DATETIMEOFFSET':
+                    warnings.append(f'{key}.{col.name}: fuso mantido no tipo nativo do destino quando suportado; valide retorno do driver e precisão temporal.')
+                if type(resolved_type).__name__.upper() in ('DATETIME2', 'TIME', 'DATETIMEOFFSET'):
+                    warnings.append(f'{key}.{col.name}: {label} neste perfil preserva até 6 casas de segundo; SQL Server pode ter 7.')
             except ValueError as exc:
                 entry['error'] = str(exc)
                 errors.append(f'{key}.{col.name}: {exc}')
-        dst = sa.Table(target_name(item['schema'], item['name']), destination, *columns, mysql_engine='InnoDB', mysql_charset='utf8mb4', mysql_collate='utf8mb4_bin')
+        table_options = dict(mysql_engine='InnoDB', mysql_charset='utf8mb4', mysql_collate='utf8mb4_bin') if kind == 'mysql' else dict(schema=schema)
+        dst = sa.Table(named(item['schema'], item['name']), destination, *columns, **table_options)
         pairs.append((src, dst))
     names = [dst.name.casefold() for _, dst in pairs]
-    if len(names) != len(set(names)): errors.append('Colisão de nomes no MySQL; renomeie as tabelas de origem.')
+    if len(names) != len(set(names)): errors.append(f'Colisão de nomes em {label}; renomeie as tabelas de origem.')
     mapping = {(s.schema, s.name): d for s, d in pairs}
     inspector = sa.inspect(engine)
     for src, dst in pairs:
@@ -170,7 +179,11 @@ def _plan(engine, selected, context, target=None, overrides=None):
             special = any(options.get(k) is not None for k in ('mssql_where',)) or bool(options.get('mssql_include') or index.get('include_columns') or options.get('mssql_columnstore'))
             if special or not cols or any(c not in dst.c for c in cols):
                 warnings.append(f'{src.fullname}: índice {index["name"]} exige revisão.'); continue
-            sa.Index(target_name(dst.name, index['name']), *[dst.c[c] for c in cols], unique=index.get('unique', False))
+            if kind == 'oracle' and index.get('unique', False):
+                # Oracle FKs require a PK/UNIQUE constraint, not only a unique index.
+                dst.append_constraint(sa.UniqueConstraint(*cols, name=named(dst.name,index['name'])))
+            else:
+                sa.Index(named(dst.name, index['name']), *[dst.c[c] for c in cols], unique=index.get('unique', False))
         context.update(stage='Ler chaves estrangeiras', object=src.fullname)
         for fk in inspector.get_foreign_keys(src.name, schema=src.schema):
             ref = mapping.get((fk.get('referred_schema') or src.schema, fk['referred_table']))
@@ -179,8 +192,15 @@ def _plan(engine, selected, context, target=None, overrides=None):
             if any(c not in dst.c for c in fk['constrained_columns']) or any(c not in ref.c for c in fk['referred_columns']): continue
             options = fk.get('options') or {}
             if any((options.get(k) or '').upper() == 'SET DEFAULT' for k in ('ondelete', 'onupdate')):
-                errors.append(f'{src.fullname}: FK {fk["name"]} usa SET DEFAULT, não suportado no MySQL.'); continue
-            dst.append_constraint(sa.ForeignKeyConstraint([dst.c[c] for c in fk['constrained_columns']], [ref.c[c] for c in fk['referred_columns']], name=target_name(dst.name, fk['name'] or 'fk'), use_alter=True, ondelete=options.get('ondelete'), onupdate=options.get('onupdate')))
+                errors.append(f'{src.fullname}: FK {fk["name"]} usa SET DEFAULT; defaults não são recriados automaticamente no perfil {label}. Revisão manual necessária.'); continue
+            if kind == 'oracle':
+                if options.get('onupdate') and options['onupdate'].upper() != 'NO ACTION':
+                    errors.append(f'{src.fullname}: Oracle não suporta ON UPDATE {options["onupdate"]} na FK {fk["name"]}.'); continue
+                if options.get('ondelete') and options['ondelete'].upper() not in ('NO ACTION','CASCADE','SET NULL'):
+                    errors.append(f'{src.fullname}: ação ON DELETE incompatível com Oracle.'); continue
+                delete_action=(options.get('ondelete') or '').upper()
+                options = dict(options, onupdate=None, ondelete=delete_action if delete_action not in ('','NO ACTION') else None)
+            dst.append_constraint(sa.ForeignKeyConstraint([dst.c[c] for c in fk['constrained_columns']], [ref.c[c] for c in fk['referred_columns']], name=named(dst.name, fk['name'] or 'fk'), use_alter=True, ondelete=options.get('ondelete'), onupdate=options.get('onupdate')))
         # SQLAlchemy's MSSQL dialect exposes UNIQUEs through get_indexes,
         # and does not implement get_unique_constraints/get_check_constraints.
         context.update(stage='Ler restrições UNIQUE', object=src.fullname)
@@ -188,33 +208,35 @@ def _plan(engine, selected, context, target=None, overrides=None):
             uniques = inspector.get_unique_constraints(src.name, schema=src.schema)
         except NotImplementedError:
             uniques = []
-        indexed_unique = {tuple(c.name for c in idx.columns) for idx in dst.indexes if idx.unique}
+        indexed_unique = {tuple(c.name for c in idx.columns) for idx in dst.indexes if idx.unique} | {tuple(c.name for c in constraint.columns) for constraint in dst.constraints if isinstance(constraint,sa.UniqueConstraint)}
         for unique in uniques:
             cols = unique.get('column_names', [])
             if cols and tuple(cols) not in indexed_unique and all(c in dst.c for c in cols):
-                dst.append_constraint(sa.UniqueConstraint(*cols, name=target_name(dst.name, unique['name'] or 'uq')))
+                dst.append_constraint(sa.UniqueConstraint(*cols, name=named(dst.name, unique['name'] or 'uq')))
         context.update(stage='Ler restrições CHECK', object=src.fullname)
         try:
             checks = inspector.get_check_constraints(src.name, schema=src.schema)
         except NotImplementedError:
             checks = []  # CHECK definitions are included in the sys.objects export.
         if checks: warnings.append(f'{src.fullname}: CHECK constraints exigem adaptação manual.')
-    context.update(stage='Checar limites e adaptar DDL para MySQL', object=None)
+    context.update(stage=f'Checar limites e adaptar DDL para {label}', object=None)
     compatibility = check_and_adapt(pairs, limits)
     for entry in column_mappings:
         dst = mapping.get((available[entry['table']]['schema'], available[entry['table']]['name']))
         if entry['error'] is None and dst is not None and entry['column'] in dst.c:
-            entry['target_type'] = str(dst.c[entry['column']].type.compile(dialect=mysql.dialect()))
+            entry['target_type'] = str(dst.c[entry['column']].type.compile(dialect=dialect))
+    compatibility['target_kind'] = kind
+    compatibility['target_schema'] = schema
+    warnings.extend(compatibility.get('warnings', []))
     compatibility['source_dictionary'] = dictionary
     compatibility['manual_mappings'] = overrides
     errors.extend(compatibility['errors'])
     for change in compatibility['changes']:
         warnings.append(f"{change['table']}.{change['column']}: {change['before']} → {change['after']} automaticamente. {change['reason']}")
-    warnings.append('DATE/DATETIME: SQL Server pode conter anos anteriores a 1000 que não cabem no intervalo documentado do MySQL. O dicionário não valida os valores; datas não são reescritas automaticamente.')
-    warnings.append('Identity, defaults, expressões calculadas e CHECKs não são recriados. PKs, índices comuns, UNIQUEs e FKs entre tabelas selecionadas são incluídos. Revise diferenças de UNIQUE com NULL, collation e limites de índices do MySQL.')
-    warnings.append('Collation utf8mb4_bin: ordenação e comparação podem diferir da origem. Revise chaves únicas, texto e regras de negócio.')
+    if kind == 'mysql': warnings.append('DATE/DATETIME: SQL Server pode conter anos anteriores a 1000 que não cabem no intervalo documentado do MySQL. O dicionário não valida os valores; datas não são reescritas automaticamente.')
+    warnings.append('Identity, defaults, expressões calculadas e CHECKs não são recriados. PKs, índices comuns, UNIQUEs e FKs entre tabelas selecionadas são incluídos. Revise diferenças de UNIQUE com NULL, collation e limites de índices do destino.')
+    if kind == 'mysql': warnings.append('Collation utf8mb4_bin: ordenação e comparação podem diferir da origem. Revise chaves únicas, texto e regras de negócio.')
     warnings.append('Views, procedures, funções, triggers, sequences e synonyms são exportados para revisão; não executados automaticamente.')
-    dialect = mysql.dialect()
     statements = []
     def compile_ddl(element, stage, name):
         context.update(stage=stage, object=name)
@@ -224,13 +246,13 @@ def _plan(engine, selected, context, target=None, overrides=None):
             detail = diagnostic(exc, stage, name)
             errors.append(f"{name}: {stage}: {detail['message']}")
     for src, d in pairs:
-        compile_ddl(CreateTable(d), 'Compilar CREATE TABLE para MySQL', src.fullname)
+        compile_ddl(CreateTable(d), f'Compilar CREATE TABLE para {label}', src.fullname)
     for src, d in pairs:
         for index in sorted(d.indexes, key=lambda i: i.name):
-            compile_ddl(CreateIndex(index), 'Compilar índice para MySQL', index.name)
+            compile_ddl(CreateIndex(index), f'Compilar índice para {label}', index.name)
         for fk in sorted(d.foreign_key_constraints, key=lambda f: f.name):
-            compile_ddl(AddConstraint(fk), 'Compilar FK para MySQL', fk.name)
-    return {'column_mappings': column_mappings, 'manual_mappings': overrides, 'compatibility': compatibility, 'pairs': pairs, 'ddl': '\n\n'.join(statements), 'warnings': warnings, 'errors': errors, 'objects': catalog['objects']}
+            compile_ddl(AddConstraint(fk), f'Compilar FK para {label}', fk.name)
+    return {'target_kind': kind, 'target_schema': schema, 'column_mappings': column_mappings, 'manual_mappings': overrides, 'compatibility': compatibility, 'pairs': pairs, 'ddl': '\n\n'.join(statements), 'warnings': warnings, 'errors': errors, 'objects': catalog['objects']}
 
 
 class MigrationError(Exception):
@@ -239,7 +261,7 @@ class MigrationError(Exception):
 
 def destination_objects(target):
     inspector = sa.inspect(target)
-    return {name.casefold() for name in inspector.get_table_names() + inspector.get_view_names()}
+    return {name.casefold() for name in inspector.get_table_names(schema=destination_schema(target,destination_kind(target))) + inspector.get_view_names(schema=destination_schema(target,destination_kind(target)))}
 
 
 def _create_object(target, element, kind, table, name):
@@ -254,17 +276,24 @@ def _create_object(target, element, kind, table, name):
         conn.commit()
         inspector = sa.inspect(conn)
         if kind == 'table':
-            found = inspector.has_table(table.name)
+            found = inspector.has_table(table.name, **({'schema': table.schema} if table.schema else {}))
             if found and target.dialect.name == 'mysql':
                 quoted = conn.dialect.identifier_preparer.quote(table.name)
                 result['mysql_ddl'] = str(conn.exec_driver_sql(f'SHOW CREATE TABLE {quoted}').one()[1])
         elif kind == 'index':
-            found = any(item['name'] == name for item in inspector.get_indexes(table.name))
+            found = any(item['name'] == name for item in inspector.get_indexes(table.name, **({'schema': table.schema} if table.schema else {})))
         else:
-            found = any(item['name'] == name for item in inspector.get_foreign_keys(table.name))
+            found = any(item['name'] == name for item in inspector.get_foreign_keys(table.name, **({'schema': table.schema} if table.schema else {})))
         if found and target.dialect.name == 'mysql' and kind != 'table':
             quoted = conn.dialect.identifier_preparer.quote(table.name)
             result['mysql_ddl'] = str(conn.exec_driver_sql(f'SHOW CREATE TABLE {quoted}').one()[1])
+        if found and target.dialect.name in ('postgresql','oracle'):
+            result['server_metadata'] = dict(schema=table.schema, table=table.name,
+                columns=[dict(name=c['name'], type=str(c['type']), nullable=c['nullable']) for c in inspector.get_columns(table.name, schema=table.schema)],
+                primary_key=inspector.get_pk_constraint(table.name, schema=table.schema),
+                unique_constraints=inspector.get_unique_constraints(table.name, schema=table.schema),
+                indexes=[dict(name=i['name'], columns=i.get('column_names'), unique=i.get('unique')) for i in inspector.get_indexes(table.name, schema=table.schema)],
+                foreign_keys=[dict(name=f['name'], columns=f['constrained_columns'], referred_table=f['referred_table']) for f in inspector.get_foreign_keys(table.name, schema=table.schema)])
         if not found: raise MigrationError('DDL confirmado, mas o objeto não foi encontrado no catálogo. Inspecione o destino antes de repetir.')
     result['verified'] = True
     result['message'] += ' Objeto confirmado no catálogo do destino.'
@@ -290,12 +319,13 @@ def execute(source, target, prepared, job, batch, existing_policy='abort', conti
         return entry
 
     def failure(exc, kind, name, table):
-        detail = diagnostic(exc, job['stage'], name, (source, target), hide_values=True)
+        detail = diagnostic(exc, job['stage'], name, (source, target), hide_values=kind != 'table')
         record(kind, name, table, 'failed', detail['message'], diagnostic=detail)
         if not continue_on_error: raise MigrationError(f"{kind} {name}: {detail['category']}. {detail['hint']}") from exc
 
     try:
         control.checkpoint(job)
+        if prepared.get('target_kind') and destination_kind(target) != prepared['target_kind']: raise MigrationError('O plano pertence a outro tipo de destino. Gere novamente.')
         if existing_policy not in ('abort', 'skip'): raise MigrationError('Política de objetos existentes inválida.')
         if prepared['errors']: raise MigrationError('Plano contém incompatibilidades bloqueantes; revise antes de executar.')
         job['stage'] = 'Verificar objetos existentes no destino'
@@ -319,7 +349,8 @@ def execute(source, target, prepared, job, batch, existing_policy='abort', conti
             except Exception as exc:
                 original = getattr(exc, 'orig', exc)
                 args = getattr(original, 'args', ())
-                if existing_policy == 'skip' and args and args[0] == 1050:
+                code = diagnostic(exc, 'Criar objeto', engines=(target,))['code']
+                if existing_policy == 'skip' and code in (1050, '42P07', 'ORA-00955'):
                     record('table', dst.name, dst.name, 'skipped', 'Objeto passou a existir após a inspeção. Preservado sem carga nem alterações.')
                 else:
                     failure(exc, 'table', dst.name, dst.name)

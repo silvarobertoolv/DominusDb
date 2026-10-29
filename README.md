@@ -1,6 +1,6 @@
-# SQLBridge — SQL Server → MySQL
+# SQLBridge — SQL Server → MySQL, PostgreSQL ou Oracle
 
-Aplicação web local em Python 3.11+ com Flask, SQLAlchemy, pymssql (FreeTDS) e PyMySQL. Preparada para catálogo do **SQL Server 2008 (10.0) / 2008 R2 (10.50)** e destino **MySQL 8**. Não usa ODBC nem precisa publicar um site. A compatibilidade com seu servidor deve ser confirmada com uma migração de teste: não foi possível acessar bancos reais neste ambiente.
+Aplicação web local em Python 3.11+ com Flask, SQLAlchemy, pymssql (FreeTDS), PyMySQL, psycopg e python-oracledb. Preparada para catálogo do **SQL Server 2008 (10.0) / 2008 R2 (10.50)** e destinos **MySQL 8**, **PostgreSQL 12+** ou **Oracle 12.1+** (driver thin). Não usa ODBC nem precisa publicar um site. Selecione o banco no formulário de destino. A compatibilidade com seu servidor deve ser confirmada com uma migração de teste: não foi possível acessar bancos reais neste ambiente.
 
 ## Instalação no Windows
 
@@ -152,3 +152,51 @@ A atividade em andamento e seu tempo aparecem mesmo enquanto o banco não respon
 **Pausar**, **Continuar** e **Cancelar** funcionam em pontos de controle entre operações/lotes. Não interrompem um SELECT, INSERT, COMMIT, COUNT ou DDL já em andamento. O cancelamento acorda uma execução pausada e reverte apenas a transação ainda pendente; COMMITs anteriores e DDLs permanecem. Em perda de conexão durante COMMIT, a confirmação pode ser incerta: confira o destino. Pausar mantém conexões e pode manter transações/bloqueios; evite pausas prolongadas e monitore o banco. Enquanto pausada/cancelando, a aplicação bloqueia alterações do plano/conexões e novas migrações.
 
 O timeout de operações é configurável nas conexões, de 10 a 3.600 segundos (padrão 300). Ele se aplica às operações do driver, não é um prazo máximo para toda a migração nem uma garantia de duração do cancelamento. A aplicação usa apenas um fluxo de cópia por vez; não desabilita UNIQUE, integridade ou durabilidade para aumentar velocidade. Gargalos de disco, CPU, rede, bloqueios e configuração dos bancos ainda exigem avaliação no ambiente real. Use as métricas para comparar configurações com uma amostra representativa, mantendo o mesmo nível de validação.
+
+## Destinos MySQL, PostgreSQL e Oracle
+
+O formulário **Banco de destino** seleciona o perfil, a porta sugerida, o campo banco/service name, o schema e as sugestões de tipos manuais. Mudar o destino invalida o plano da interface e limpa seus ajustes de tipos: conecte o novo destino e gere novamente. O servidor também recusa um plano criado para outro dialeto. O estado da origem continua SQL Server, inclusive versão 2008/2008 R2.
+
+Todos os destinos mantêm: inventário e dicionário parametrizado do SQL Server; plano revisável; ajustes manuais por coluna com validação e sem aceitar SQL arbitrário; criação e confirmação por objeto no catálogo; opção de pular tabelas/views existentes; falhas isoladas conforme configuração; carga adaptativa; orçamento aproximado de memória; transação por tabela ou por lote; COUNT opcional; pausa, cancelamento e ajuste de lote; relatório completo e monitor incremental. Objetos existentes não são reutilizados nem modificados; pular não completa uma tabela parcial. FKs que dependam de tabelas puladas/falhas continuam sinalizadas para revisão.
+
+Instale as novas dependências antes de iniciar:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+No ambiente virtual Windows, use `.venv\Scripts\python.exe -m pip install -r requirements.txt`; no Linux/macOS, `.venv/bin/python -m pip install -r requirements.txt`. PostgreSQL usa psycopg 3 com pacote binário. Oracle usa python-oracledb em modo **thin** e não exige Instant Client; a conexão deste modo requer Oracle 12.1+ e autenticação compatível. Oracle 11g, SID em lugar de service name, modo thick, SYSDBA, external authentication e wallets/MTLS que exijam configuração específica não são configurados pela interface desta versão.
+
+### PostgreSQL
+
+- Informe host, porta (sugestão 5432), banco, usuário, senha e schema já existente (padrão `public`). Use um schema dedicado e conceda USAGE e CREATE ao usuário; ele deve poder inserir, contar e alterar os objetos que criar. Não são criados bancos, usuários ou schemas automaticamente.
+- TLS marcado usa `sslmode=verify-full`; configure uma CA confiável no campo opcional de caminho local, ou pelo mecanismo padrão do libpq. Com TLS desmarcado, usa `prefer`, que pode permitir fallback sem criptografia. O timeout configura `statement_timeout` por operação no servidor.
+- O perfil consulta versão, block_size e encoding; UTF8 é recomendado. Nomes gerados respeitam 63 bytes com hash e os objetos são qualificados pelo schema. Colunas acima de 63 bytes e nomes de colunas de sistema são bloqueados, sem renomeação silenciosa.
+- Texto grande vira TEXT, binário vira BYTEA, GUID vira UUID, BIT vira BOOLEAN, DECIMAL usa NUMERIC (incluindo escala 38 quando válida), DATETIMEOFFSET vira TIMESTAMP WITH TIME ZONE. Strings de hora/data com fuso precisam conter offset explícito; não é assumido o fuso da máquina.
+- TOAST é nativo para valores variáveis: não se aplica a regra MySQL de 65.535 bytes e não é aplicado ROW_FORMAT. A checagem estima limite local de tupla, quantidade de colunas, chaves e compatibilidade de FKs. Índices btree sobre TEXT/BYTEA podem falhar conforme o tamanho real dos dados; o plano sinaliza essa limitação.
+- PostgreSQL rejeita caractere NUL em texto; a carga interrompe a tabela, sem retirar caracteres silenciosamente. BYTEA preserva bytes NUL. Collation e comparação não são consideradas equivalentes às da origem.
+
+### Oracle
+
+- Informe host, porta (sugestão 1521), **service_name** registrado no listener (não SID), usuário e senha. O schema padrão é o usuário conectado; um owner explícito é opcional e precisa existir e estar autorizado para as operações. Recomenda-se um usuário próprio para migração com CREATE SESSION, CREATE TABLE, quota de tablespace e permissões necessárias para seus objetos/relacionamentos. Não use SYS/SYSTEM como conta da aplicação.
+- TLS marcado usa TCPS com verificação do nome do servidor; configure um certificado confiável e a porta correta no servidor (TCPS pode usar 2484). A interface não configura wallets ou certificados de cliente para MTLS. Desmarcado usa TCP. Timeout define call_timeout do driver por round trip.
+- O perfil consulta os charsets do banco/nacional e tenta consultar db_block_size. Se a segunda consulta não estiver autorizada, usa um orçamento conservador de chave baseado em bloco de 8 KiB e avisa, sem exigir novos privilégios. As estimativas não certificam todos os limites físicos do Oracle.
+- Nomes de tabelas/índices/constraints são gerados em minúsculas lógicas (não exigem aspas para nomes simples) com hash para respeitar 30 bytes, por compatibilidade conservadora. Colunas mantêm os nomes originais quando cabem; acima de 30 bytes ou `ROWID` maiúsculo ficam bloqueadas. Não é assumido suporte a identificadores estendidos ou MAX_STRING_SIZE=EXTENDED.
+- Inteiros/decimais viram NUMBER, BIT vira NUMBER(1,0), Unicode/textos curtos viram NVARCHAR2 e longos/MAX viram NCLOB. Esse uso do charset nacional evita depender do charset principal para preservar Unicode. Binários pequenos viram RAW; longos viram BLOB; GUID vira NVARCHAR2(36). VARCHAR2/NVARCHAR2 manuais têm limite conservador de 1.000 caracteres; RAW, 2.000 bytes.
+- DATETIME/DATETIME2 tornam-se TIMESTAMP com precisão 6. DATETIMEOFFSET usa TIMESTAMP WITH TIME ZONE com bind explícito DB_TYPE_TIMESTAMP_TZ; offset ausente é rejeitado. TIME vira INTERVAL DAY(1) TO SECOND(6), com zero dias: é uma representação de duração/hora e exige revisar regras e consultas que esperem o tipo TIME.
+- **Oracle não distingue texto vazio de NULL.** O perfil interrompe a carga ao encontrar strings ou binários vazios, evitando mudança silenciosa de significado; decida e aplique a transformação de negócio na origem/preparação dos dados. LOBs vazios também exigem tratamento específico, não presumido pelo carregador.
+- LOBs não entram em índices/FKs convencionais. UNIQUEs de índices simples da origem são emitidos como constraints UNIQUE, para que possam ser referenciados por FKs no Oracle. Isso pode antecipar sua validação para a fase de carga. ON UPDATE com ação de propagação não é silenciosamente descartado: o plano bloqueia e informa a incompatibilidade.
+
+### Confirmação, relatórios e transações nos novos destinos
+
+Após DDL, todos os perfis confirmam COMMIT e verificam o objeto no catálogo. MySQL mantém SHOW CREATE TABLE e avisos de SHOW WARNINGS. PostgreSQL/Oracle mostram os metadados retornados pelo Inspector — colunas/tipos, nulabilidade, PK, UNIQUEs, índices e FKs — sem requerer DBMS_METADATA ou apresentar DDL reconstruída como se fosse o retorno literal do servidor. O ZIP tem `mysql-plan.sql`, `postgresql-plan.sql` ou `oracle-plan.sql`, conforme o destino. A análise de compatibilidade e o relatório registram o tipo de banco e o schema.
+
+MySQL e Oracle têm COMMIT implícito de DDL. PostgreSQL suporta DDL transacional, mas esta aplicação confirma **cada objeto separadamente** para manter o relatório e isolar falhas; o fluxo completo não é uma única transação. Cancelar não desfaz DDLs ou lotes anteriores. O modo por tabela continua revertendo a carga pendente da tabela; o modo por lote pode deixar cargas parciais em todos os destinos.
+
+Erros Oracle incluem código ORA quando fornecido; PostgreSQL inclui SQLSTATE. Há orientações para duplicidade, nulabilidade, encoding, precisão/tamanho, integridade referencial, privilégios, quota e timeout. Valores dos registros não são expostos nos diagnósticos da carga. Informações de credenciais permanecem na memória do processo.
+
+### Escopo e validação
+
+A conversão de views, procedures, funções, triggers, sequences/synonyms, defaults, colunas calculadas, geradores IDENTITY/SEQUENCE e CHECKs de negócio continua manual, em todos os destinos. FKs com SET DEFAULT ficam bloqueadas também no PostgreSQL, pois os defaults não são recriados por este fluxo. SET DEFAULT em FKs fica bloqueado em todos os destinos, pois os defaults da origem não são recriados automaticamente. O sistema copia valores e não promete equivalência automática de T-SQL, collation, regras de NULL, fusos ou precisão de sete casas temporais. Os perfis não alteram parâmetros de servidor para contornar limites.
+
+A suíte cobre compilação independente dos três dialetos, tipos, metadados de destino simulados, API, parser manual, compatibilidade, preservação de objetos, controle/transações e cópia em lotes com SQLite. Os drivers são instalados e as factories de conexão são verificadas sem conectar. **Não houve acesso a servidores PostgreSQL/Oracle reais neste ambiente**: valide conexão, permissões, catálogo, LOBs, Unicode, datas/fusos, grandes cargas e regras de negócio com uma cópia de teste antes de usar o destino.

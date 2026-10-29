@@ -191,3 +191,35 @@ def test_invalid_performance_options_do_not_start_worker(client,options):
     state.update(source=object(),target=object(),plan=dict(id='p',errors=[]))
     assert post(client,'/api/run',dict(plan_id='p',confirmation='MIGRAR',**options)).status_code==400
     assert state['job'] is None
+
+
+@pytest.mark.parametrize('destination',['postgresql','oracle'])
+def test_native_plan_api_exports_correct_dialect_types_and_filename(client,monkeypatch,destination):
+    import sqlalchemy as sa
+    import migration
+    import io,zipfile
+    source=sa.create_engine('sqlite://')
+    sa.Table('t',sa.MetaData(schema='main'),sa.Column('id',sa.BigInteger,primary_key=True),sa.Column('memo',sa.Text)).metadata.create_all(source)
+    state['source']=source
+    monkeypatch.setattr(migration,'inventory',lambda _:dict(tables=[dict(id='main.t',schema='main',name='t')],objects=[]))
+    data=post(client,'/api/plan',dict(tables=['main.t'],target_kind=destination)).get_json()
+    assert data['target_kind']==destination and not data['errors']
+    assert 'ROW_FORMAT' not in data['ddl']
+    assert ('NCLOB' if destination=='oracle' else 'TEXT') in data['ddl']
+    assert ('NUMBER(19,0)' if destination=='oracle' else 'UUID') in data['type_examples']
+    archive=zipfile.ZipFile(io.BytesIO(client.get('/api/export').data))
+    assert destination+'-plan.sql' in archive.namelist()
+
+
+def test_oracle_connection_probe_uses_dual(client,monkeypatch):
+    import app as module
+    from types import SimpleNamespace
+    calls=[]
+    class Conn:
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+        def execute(self,sql):calls.append(str(sql))
+    engine=SimpleNamespace(dialect=SimpleNamespace(name='oracle'),_sqlbridge_schema=None,connect=lambda:Conn())
+    monkeypatch.setattr(module,'engine_for',lambda data,kind:engine)
+    assert post(client,'/api/connect/target',dict(db_type='oracle')).status_code==200
+    assert calls==['SELECT 1 FROM DUAL']

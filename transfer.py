@@ -1,7 +1,7 @@
 """Bounded batch copy, cooperative control and per-table timing metrics."""
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as time_type, timedelta
 import sqlalchemy as sa
 from pymysql.cursors import Cursor
 
@@ -82,7 +82,7 @@ def row_bytes(row):
     return sum(len(v.encode('utf-8')) if isinstance(v, str) else len(v) if isinstance(v, (bytes, bytearray, memoryview)) else 24 for v in row) + 16 * len(row)
 
 
-def payload_chunks(rows, names, uuid_columns, max_bytes):
+def payload_chunks(rows, names, uuid_columns, max_bytes, destination=None, column_types=None):
     payload, size = [], 0
     for row in rows:
         cost = row_bytes(row)
@@ -92,6 +92,28 @@ def payload_chunks(rows, names, uuid_columns, max_bytes):
         entry = dict(zip(names, row))
         for name in uuid_columns:
             if entry[name] is not None: entry[name] = str(entry[name])
+        if destination in ('postgresql','oracle'):
+            for name,value in entry.items():
+                if value is None: continue
+                if destination=='postgresql' and isinstance(value,str) and '\x00' in value:
+                    raise ValueError(f'{name}: PostgreSQL não aceita caractere NUL em texto. Transformação manual necessária.')
+                if destination=='oracle' and (isinstance(value,str) and value=='' or isinstance(value,(bytes,bytearray,memoryview)) and len(value)==0):
+                    raise ValueError(f'{name}: valor vazio não pode ser preservado como distinto de NULL no perfil Oracle; transformação manual necessária.')
+                typ=(column_types or {}).get(name)
+                if getattr(typ,'timezone',False):
+                    if isinstance(value,str):
+                        try: value=datetime.fromisoformat(value[:-1]+'+00:00' if value.endswith('Z') else value)
+                        except ValueError: raise ValueError(f'{name}: data/hora com fuso deve ter formato ISO com offset; transformação manual necessária.') from None
+                    if not isinstance(value,(datetime,time_type)) or value.tzinfo is None or value.utcoffset() is None:
+                        raise ValueError(f'{name}: destino com fuso exige offset explícito; não será assumido o fuso da máquina.')
+                    entry[name]=value
+                if destination=='oracle' and isinstance(value,time_type) and type(typ).__name__.upper()=='INTERVAL':
+                    if value.tzinfo is not None: raise ValueError(f'{name}: hora com fuso exige política explícita para INTERVAL Oracle.')
+                    entry[name]=timedelta(hours=value.hour,minutes=value.minute,seconds=value.second,microseconds=value.microsecond)
+                elif destination=='oracle' and isinstance(value,bool) and isinstance(typ,sa.Numeric):entry[name]=int(value)
+                elif destination=='postgresql' and isinstance(typ,sa.Boolean) and isinstance(value,int):
+                    if value not in (0,1):raise ValueError(f'{name}: BOOLEAN exige 0/1 ou bool; conversão de valores necessária.')
+                    entry[name]=bool(value)
         payload.append(entry); size += cost
     if payload: yield payload, size
 
@@ -109,6 +131,9 @@ def copy_table(source, target, src, dst, job, batch, options, control):
     job.setdefault('table_progress', []).append(metrics)
     names = list(src.c.keys())
     uuid_columns = [c.name for c in src.columns if type(c.type).__name__.upper() in ('UNIQUEIDENTIFIER', 'UUID')]
+    destination=target.dialect.name
+    target_label={'mysql':'MySQL','postgresql':'PostgreSQL','oracle':'Oracle'}.get(destination,'destino')
+    column_types={c.name:c.type for c in dst.columns}
     stmt = dst.insert()  # Compile/cache the statement across batches.
     max_bytes = options.get('max_batch_mb', 8) * 1024 * 1024
     per_batch = options.get('transaction_mode', 'table') == 'batch'
@@ -127,7 +152,7 @@ def copy_table(source, target, src, dst, job, batch, options, control):
     def commit(out):
         nonlocal pending
         control.checkpoint(job)
-        activity(job, 'Aguardando COMMIT no MySQL')
+        activity(job, 'Aguardando COMMIT no '+target_label)
         stamp = time.perf_counter(); out.commit()
         metrics['commit_seconds'] += time.perf_counter() - stamp
         metrics['confirmed_rows'] += pending
@@ -164,14 +189,14 @@ def copy_table(source, target, src, dst, job, batch, options, control):
                     metrics['read_seconds'] += time.perf_counter() - stamp
                     if not rows: break
                     activity(job, 'Preparando lote em memória')
-                    chunks = iter(payload_chunks(rows, names, uuid_columns, max_bytes))
+                    chunks = iter(payload_chunks(rows, names, uuid_columns, max_bytes, destination, column_types))
                     while True:
                         stamp = time.perf_counter()
                         try: payload, size = next(chunks)
                         except StopIteration: break
                         metrics['prepare_seconds'] += time.perf_counter() - stamp
                         control.checkpoint(job)
-                        activity(job, f'Gravando lote no MySQL ({len(payload)} linhas)')
+                        activity(job, f'Gravando lote em {target_label} ({len(payload)} linhas)')
                         stamp = time.perf_counter(); out.execute(stmt, payload)
                         # PyMySQL exposes the warning count from the OK packet. Avoid
                         # a SHOW WARNINGS network round trip on every clean INSERT.
