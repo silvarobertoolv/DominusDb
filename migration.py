@@ -1,6 +1,7 @@
 """SQL Server inventory and conservative MySQL migration planner."""
 import hashlib
 from diagnostics import diagnostic
+from type_mapping import parse_target_type, validate_overrides
 from compatibility import target_limits, source_dictionary, check_and_adapt
 from datetime import datetime, timezone
 import sqlalchemy as sa
@@ -15,6 +16,7 @@ def target_name(schema, name):
 
 def convert_type(t):
     name = type(t).__name__.upper()
+    name = {'BIGINTEGER': 'BIGINT', 'SMALLINTEGER': 'SMALLINT', 'DOUBLE_PRECISION': 'DOUBLE'}.get(name, name)
     if name in ('TINYINT', 'SMALLINT', 'INTEGER', 'INT', 'BIGINT'):
         return {'TINYINT': mysql.TINYINT(unsigned=True), 'SMALLINT': sa.SmallInteger(), 'INTEGER': sa.Integer(), 'INT': sa.Integer(), 'BIGINT': sa.BigInteger()}[name]
     if name in ('DECIMAL', 'NUMERIC', 'MONEY', 'SMALLMONEY'):
@@ -88,19 +90,23 @@ class PlanError(Exception):
         super().__init__(f'{stage}: {type(cause).__name__}')
 
 
-def plan(engine, selected, target=None):
+def plan(engine, selected, target=None, overrides=None):
     context = {'stage': 'Ler catálogo', 'object': None}
     try:
-        return _plan(engine, selected, context, target)
+        return _plan(engine, selected, context, target, validate_overrides(overrides))
     except Exception as exc:
         raise PlanError(context['stage'], context['object'], exc) from exc
 
 
-def _plan(engine, selected, context, target=None):
+def _plan(engine, selected, context, target=None, overrides=None):
     catalog = inventory(engine)
     available = {t['id']: t for t in catalog['tables']}
     if not selected or len(selected) != len(set(selected)) or any(x not in available for x in selected):
         raise ValueError('Selecione tabelas válidas, sem duplicatas.')
+    overrides = overrides or {}
+    unknown = set(overrides) - set(selected)
+    if unknown: raise ValueError('Mapeamento aponta para tabela fora da seleção: ' + ', '.join(sorted(unknown)))
+    column_mappings = []
     source = sa.MetaData()
     destination = sa.MetaData()
     pairs, warnings, errors = [], [], []
@@ -117,20 +123,37 @@ def _plan(engine, selected, context, target=None):
         if engine.dialect.name == 'mssql' and len(definitions) != len(src.columns):
             errors.append(f'{key}: dicionário incompleto ou estrutura alterada durante a leitura. Confira permissões de metadados e gere o plano novamente.')
         definitions_by_name = {d['column_name']: d for d in definitions}
+        unknown_columns = set(overrides.get(key, {})) - set(src.c.keys())
+        if unknown_columns: errors.append(f'{key}: colunas de mapeamento inexistentes: ' + ', '.join(sorted(unknown_columns)))
         pk = set(c.name for c in src.primary_key.columns)
         columns = []
         for col in src.columns:
             context.update(stage='Converter coluna', object=f'{key}.{col.name}')
+            manual = overrides.get(key, {}).get(col.name)
+            entry = dict(table=key, column=col.name, source_type=str(col.type),
+                         requested_type=manual, target_type=None, automatic_type=None, error=None)
+            column_mappings.append(entry)
+            resolved_type = dictionary_type(col, definitions_by_name.get(col.name, {}))
             try:
+                try:
+                    automatic = convert_type(resolved_type)
+                    entry['automatic_type'] = str(automatic.compile(dialect=mysql.dialect()))
+                except ValueError:
+                    if manual is None: raise
                 if len(col.name) > 64: raise ValueError('nome de coluna excede o limite de 64 caracteres do MySQL')
-                resolved_type = dictionary_type(col, definitions_by_name.get(col.name, {}))
-                typ = convert_type(resolved_type)
-                columns.append(sa.Column(col.name, typ, nullable=False if col.name in pk else col.nullable, primary_key=col.name in pk, autoincrement=False))
+                typ = parse_target_type(manual) if manual is not None else automatic
+                entry['target_type'] = str(typ.compile(dialect=mysql.dialect()))
+                columns.append(sa.Column(col.name, typ, nullable=False if col.name in pk else col.nullable,
+                                         primary_key=col.name in pk, autoincrement=False,
+                                         info={'manual_type': manual is not None}))
+                if manual is not None:
+                    warnings.append(f'{key}.{col.name}: tipo escolhido manualmente: {entry["target_type"]}. Revise a compatibilidade dos valores; a escolha não transforma os dados de origem.')
                 if any(value is not None for value in (col.default, col.server_default, col.computed, col.identity)):
                     warnings.append(f'{key}.{col.name}: valor copiado; default, cálculo ou identity não recriados.')
                 if type(resolved_type).__name__.upper() in ('DATETIME2', 'TIME'):
                     warnings.append(f'{key}.{col.name}: MySQL preserva até 6 casas de segundo; SQL Server pode ter 7.')
             except ValueError as exc:
+                entry['error'] = str(exc)
                 errors.append(f'{key}.{col.name}: {exc}')
         dst = sa.Table(target_name(item['schema'], item['name']), destination, *columns, mysql_engine='InnoDB', mysql_charset='utf8mb4', mysql_collate='utf8mb4_bin')
         pairs.append((src, dst))
@@ -177,7 +200,12 @@ def _plan(engine, selected, context, target=None):
         if checks: warnings.append(f'{src.fullname}: CHECK constraints exigem adaptação manual.')
     context.update(stage='Checar limites e adaptar DDL para MySQL', object=None)
     compatibility = check_and_adapt(pairs, limits)
+    for entry in column_mappings:
+        dst = mapping.get((available[entry['table']]['schema'], available[entry['table']]['name']))
+        if entry['error'] is None and dst is not None and entry['column'] in dst.c:
+            entry['target_type'] = str(dst.c[entry['column']].type.compile(dialect=mysql.dialect()))
     compatibility['source_dictionary'] = dictionary
+    compatibility['manual_mappings'] = overrides
     errors.extend(compatibility['errors'])
     for change in compatibility['changes']:
         warnings.append(f"{change['table']}.{change['column']}: {change['before']} → {change['after']} automaticamente. {change['reason']}")
@@ -201,7 +229,7 @@ def _plan(engine, selected, context, target=None):
             compile_ddl(CreateIndex(index), 'Compilar índice para MySQL', index.name)
         for fk in sorted(d.foreign_key_constraints, key=lambda f: f.name):
             compile_ddl(AddConstraint(fk), 'Compilar FK para MySQL', fk.name)
-    return {'compatibility': compatibility, 'pairs': pairs, 'ddl': '\n\n'.join(statements), 'warnings': warnings, 'errors': errors, 'objects': catalog['objects']}
+    return {'column_mappings': column_mappings, 'manual_mappings': overrides, 'compatibility': compatibility, 'pairs': pairs, 'ddl': '\n\n'.join(statements), 'warnings': warnings, 'errors': errors, 'objects': catalog['objects']}
 
 
 class MigrationError(Exception):

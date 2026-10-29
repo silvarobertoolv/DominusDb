@@ -82,7 +82,7 @@ def storage(typ):
         return 12, 20  # Logical descriptor and DYNAMIC external reference (DDL estimate).
     if isinstance(typ, sa.String):
         size = (typ.length or 0) * 4
-        return size + (2 if size > 255 else 1), (20 if size > 255 else size) + 2
+        return size + (2 if size > 255 else 1), (size if name == 'CHAR' and size < 768 else 20 if size > 255 else size) + 2
     if name in ('BINARY', 'VARBINARY'):
         size = typ.length or 0
         return size + (2 if name == 'VARBINARY' else 0), ((20 if size > 255 else size) + 2 if name == 'VARBINARY' else size)
@@ -127,7 +127,7 @@ def check_and_adapt(pairs, limits):
         before = row_estimate(table)
         if len(table.columns) > limits['max_columns']:
             errors.append(f'{src.fullname}: {len(table.columns)} colunas excedem o limite InnoDB de {limits["max_columns"]}. Divida a tabela; conversão de tipos não resolve.')
-        candidates = sorted((c for c in table.columns if c.name not in protected[table.name]
+        candidates = sorted((c for c in table.columns if c.name not in protected[table.name] and not c.info.get('manual_type')
                              and (isinstance(c.type, sa.String) and not is_lob(c.type)
                                   or type(c.type).__name__.upper() == 'VARBINARY')),
                             key=lambda c: storage(c.type)[0], reverse=True)

@@ -9,6 +9,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import URL
 from migration import inventory, plan, execute, PlanError, destination_objects
 from diagnostics import diagnostic
+from type_mapping import TYPE_EXAMPLES
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
@@ -103,7 +104,7 @@ def make_plan():
     try:
         selected = (request.get_json() or {}).get('tables')
         if not isinstance(selected, list) or not all(isinstance(x, str) for x in selected): return error('Seleção inválida.')
-        prepared = plan(state['source'], selected, state['target'])
+        prepared = plan(state['source'], selected, state['target'], (request.get_json() or {}).get('overrides'))
         prepared['id'] = secrets.token_urlsafe(24)
         prepared['destination_check'] = []
         if state['target'] is not None:
@@ -113,7 +114,7 @@ def make_plan():
             except Exception as exc:
                 detail = diagnostic(exc, 'Inspecionar destino', engines=(state['target'],))
                 prepared['warnings'].append(f"Não foi possível inspecionar o destino: {detail['message']}. A execução fará nova verificação.")
-        response = jsonify(compatibility=prepared.get('compatibility'), destination_check=prepared['destination_check'], id=prepared['id'], ddl=prepared['ddl'], warnings=prepared['warnings'], errors=prepared['errors'], objects=prepared['objects'], tables=[{'source': s.fullname, 'target': d.name, 'columns': [{'name': c.name, 'type': str(c.type.compile(dialect=sa.dialects.mysql.dialect()))} for c in d.columns]} for s,d in prepared['pairs']])
+        response = jsonify(type_examples=TYPE_EXAMPLES, column_mappings=prepared.get('column_mappings', []), manual_mappings=prepared.get('manual_mappings', {}), compatibility=prepared.get('compatibility'), destination_check=prepared['destination_check'], id=prepared['id'], ddl=prepared['ddl'], warnings=prepared['warnings'], errors=prepared['errors'], objects=prepared['objects'], tables=[{'source': s.fullname, 'target': d.name, 'columns': [{'name': c.name, 'type': str(c.type.compile(dialect=sa.dialects.mysql.dialect()))} for c in d.columns]} for s,d in prepared['pairs']])
         state['plan'] = prepared
         return response
     except PlanError as exc: return plan_diagnostic(exc)
@@ -136,7 +137,7 @@ def run():
     continue_on_error = data.get('continue_on_error', True)
     if existing_policy not in ('abort', 'skip'): return error('Política de objetos existentes inválida.')
     if not isinstance(continue_on_error, bool): return error('Opção de continuar após erros deve ser booleana.')
-    job = {'plan_id': prepared['id'], 'plan_warnings': prepared.get('warnings', []), 'compatibility': prepared.get('compatibility'), 'status': 'queued', 'rows': 0, 'logs': [], 'tables': [], 'stage': 'Preparando'}
+    job = {'plan_id': prepared['id'], 'plan_warnings': prepared.get('warnings', []), 'compatibility': prepared.get('compatibility'), 'manual_mappings': prepared.get('manual_mappings', {}), 'status': 'queued', 'rows': 0, 'logs': [], 'tables': [], 'stage': 'Preparando'}
     state['job'] = job
     threading.Thread(target=execute, args=(state['source'], state['target'], prepared, job, batch, existing_policy, continue_on_error), daemon=True).start()
     return jsonify(ok=True)

@@ -120,3 +120,15 @@ A checagem também antecipa índices longos (1071), TEXT/BLOB indexados sem pref
 Na interface, abra **Checagem de compatibilidade e ajustes da DDL** e **Dicionário de dados consultado**. O ZIP do plano inclui `compatibilidade.json`; o relatório da execução também mantém essa análise. O mapeamento de colunas e o SQL exibem os tipos finais.
 
 **Limites da análise:** não varre os registros nem garante que todo valor será aceito pelo servidor. Valores pequenos que permaneçam inline, configuração/versão do MySQL, packet size, collations, regras de UNIQUE, datas anteriores a 1000 e outras diferenças semânticas ainda podem causar falhas durante a carga. Tipos desconhecidos/espaciais e DATETIMEOFFSET continuam exigindo decisão manual. A carga estrita e o relatório por objeto permanecem ativos. Valide uma cópia de teste no MySQL real antes de usar o banco migrado.
+
+## Ajuste manual do tipo de destino por coluna
+
+`BigInteger`/`SmallInteger` do SQLAlchemy são reconhecidos automaticamente como BIGINT/SMALLINT. Quando outro tipo exigir mapeamento manual, a coluna continua visível na seção **Mapeamento de colunas · ajustes manuais**, junto com o tipo de origem, tipo automático disponível e motivo da pendência.
+
+Informe o tipo no campo **Tipo manual** (há sugestões), por exemplo `BIGINT`, `BIGINT UNSIGNED`, `VARCHAR(255)`, `LONGTEXT`, `DECIMAL(18,2)`, `VARBINARY(255)`, `DATETIME(6)` ou `DATE`. Clique em **Aplicar ajustes e gerar plano novamente**. O novo plano inclui a coluna, gera nova DDL e repete todas as checagens de tamanho de linha, índices e FKs. Sem bloqueios, a migração segue pelo botão normal. Alterações não aplicadas desabilitam a execução na interface; o servidor também invalida planos anteriores ao gerar um novo.
+
+Deixe o campo vazio para voltar ao automático, ou use **Limpar todos os ajustes** e regenere. As escolhas ficam nesta sessão da interface; recarregar a página/encerrar a aplicação não é uma configuração persistente. Os ajustes aplicados são incluídos no relatório da execução e em `compatibilidade.json` no ZIP do plano.
+
+O servidor aceita apenas tipos de uma lista controlada, com comprimentos/precisão/escala válidos; o campo não aceita SQL, cláusulas DEFAULT, COLLATE ou comandos arbitrários. Tipos manuais não são sobrescritos pelo ajuste automático de tamanho de linha. Uma escolha incompatível continua bloqueando o plano até ser corrigida, inclusive TEXT em PK/índice sem prefixo ou números diferentes nos lados de uma FK.
+
+O ajuste define **o tipo da coluna na DDL**, não uma transformação dos valores. Reduzir tamanhos, precisão/escala, trocar texto por número ou escolher DATETIME para DATETIMEOFFSET pode exigir preparação adicional dos dados e decisão sobre fuso horário. A carga estrita continua rejeitando valores incompatíveis. A origem e as tabelas existentes no destino não são alteradas por essa edição.

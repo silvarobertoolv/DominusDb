@@ -122,3 +122,31 @@ def test_plan_api_and_zip_include_adapted_ddl_and_dictionary(client, monkeypatch
     report=json.loads(archive.read('compatibilidade.json'))
     assert report['changes']==data['compatibility']['changes']
     assert report['source_dictionary'][0]['table']=='main.wide'
+
+
+def test_manual_mapping_can_unblock_plan_and_run_without_accepting_stale_id(client, monkeypatch):
+    import sqlalchemy as sa
+    import migration
+    import app as module
+    source=sa.create_engine('sqlite://')
+    sa.Table('t',sa.MetaData(schema='main'),sa.Column('id',sa.Integer,primary_key=True),sa.Column('problem',sa.String(100))).metadata.create_all(source)
+    state.update(source=source,target=sa.create_engine('sqlite://'))
+    monkeypatch.setattr(migration,'inventory',lambda _:dict(tables=[dict(id='main.t',schema='main',name='t')],objects=[]))
+    original=migration.dictionary_type
+    monkeypatch.setattr(migration,'dictionary_type',lambda c,d:sa.types.NullType() if c.name=='problem' else original(c,d))
+    first=post(client,'/api/plan',dict(tables=['main.t'])).get_json()
+    assert first['errors'] and first['column_mappings'][1]['error']
+    assert post(client,'/api/run',dict(plan_id=first['id'],confirmation='MIGRAR')).status_code==400
+    corrected=post(client,'/api/plan',dict(tables=['main.t'],overrides={'main.t':{'problem':'VARCHAR(100)'}})).get_json()
+    assert not corrected['errors'] and corrected['id']!=first['id']
+    assert corrected['manual_mappings']=={'main.t':{'problem':'VARCHAR(100)'}}
+    assert post(client,'/api/run',dict(plan_id=first['id'],confirmation='MIGRAR')).status_code==400
+    captured={}
+    class Thread:
+        def __init__(self,target,args,daemon):captured['plan']=args[2]
+        def start(self):pass
+    monkeypatch.setattr(module.threading,'Thread',Thread)
+    response=post(client,'/api/run',dict(plan_id=corrected['id'],confirmation='MIGRAR'))
+    assert response.status_code==200
+    assert captured['plan']['pairs'][0][1].c.problem.type.length==100
+    assert state['job']['manual_mappings']==corrected['manual_mappings']
