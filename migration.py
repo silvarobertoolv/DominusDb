@@ -2,6 +2,7 @@
 import hashlib
 from diagnostics import diagnostic
 from type_mapping import parse_target_type, validate_overrides
+from transfer import copy_table, TransferControl, MigrationCancelled, activity
 from compatibility import target_limits, source_dictionary, check_and_adapt
 from datetime import datetime, timezone
 import sqlalchemy as sa
@@ -270,10 +271,13 @@ def _create_object(target, element, kind, table, name):
     return result
 
 
-def execute(source, target, prepared, job, batch, existing_policy='abort', continue_on_error=False):
+def execute(source, target, prepared, job, batch, existing_policy='abort', continue_on_error=False, options=None, control=None):
     """Never modifies existing tables. Independent failures may be isolated."""
+    options = options or {}
+    control = control or TransferControl(batch)
     job.update(status='running', rows=0, rows_in_flight=0, logs=[], tables=[], events=[],
-               options={'existing_policy': existing_policy, 'continue_on_error': continue_on_error},
+               options={'existing_policy': existing_policy, 'continue_on_error': continue_on_error, 'batch': batch, **options},
+               table_progress=[], paused_seconds=0.,
                started_at=datetime.now(timezone.utc).isoformat())
     pairs = prepared['pairs']
     created, loaded = set(), set()
@@ -291,6 +295,7 @@ def execute(source, target, prepared, job, batch, existing_policy='abort', conti
         if not continue_on_error: raise MigrationError(f"{kind} {name}: {detail['category']}. {detail['hint']}") from exc
 
     try:
+        control.checkpoint(job)
         if existing_policy not in ('abort', 'skip'): raise MigrationError('Política de objetos existentes inválida.')
         if prepared['errors']: raise MigrationError('Plano contém incompatibilidades bloqueantes; revise antes de executar.')
         job['stage'] = 'Verificar objetos existentes no destino'
@@ -301,6 +306,8 @@ def execute(source, target, prepared, job, batch, existing_policy='abort', conti
                     record('table', d.name, d.name, 'failed', 'Já existe no destino. A política escolhida exige interromper antes de criar objetos.')
             raise MigrationError('Tabela de destino já existe. Escolha pular tabelas existentes ou use outro banco.')
         for _, dst in pairs:
+            control.checkpoint(job)
+            activity(job, f'Criando/verificando tabela {dst.name}')
             if dst.name.casefold() in existing:
                 record('table', dst.name, dst.name, 'skipped', 'Já existe no destino; estrutura, dados, índices e FKs preservados. Conteúdo não validado.')
                 continue
@@ -317,51 +324,26 @@ def execute(source, target, prepared, job, batch, existing_policy='abort', conti
                 else:
                     failure(exc, 'table', dst.name, dst.name)
         for src, dst in pairs:
+            control.checkpoint(job)
             if dst.name not in created:
                 record('data', dst.name, dst.name, 'skipped', 'Carga omitida: tabela não criada e verificada nesta execução.')
                 continue
             job['stage'] = f'Copiar dados de {src.fullname}'
-            copied = 0
             try:
-                with source.connect().execution_options(stream_results=True) as inc, target.begin() as out:
-                    # Reject silent conversion/truncation rather than reporting corrupted data as success.
-                    if target.dialect.name == 'mysql':
-                        mode = out.exec_driver_sql('SELECT @@SESSION.sql_mode').scalar() or ''
-                        modes = set(mode.split(',')) - {''}
-                        modes.add('STRICT_ALL_TABLES')
-                        out.exec_driver_sql('SET SESSION sql_mode = %s', (','.join(sorted(modes)),))
-                    result = inc.execute(sa.select(src))
-                    try:
-                        while True:
-                            rows = result.fetchmany(batch)
-                            if not rows: break
-                            payload = []
-                            for row in rows:
-                                entry = dict(row._mapping)
-                                for col in src.columns:
-                                    if entry[col.name] is not None and type(col.type).__name__.upper() in ('UNIQUEIDENTIFIER', 'UUID'):
-                                        entry[col.name] = str(entry[col.name])
-                                payload.append(entry)
-                            out.execute(dst.insert(), payload)
-                            if target.dialect.name == 'mysql':
-                                warnings = out.exec_driver_sql('SHOW WARNINGS').fetchall()
-                                if warnings:
-                                    code = int(warnings[0][1])
-                                    raise RuntimeError(code, 'Aviso durante INSERT; transação revertida para evitar conversão silenciosa.')
-                            copied += len(rows)
-                            job['rows_in_flight'] = copied
-                    finally:
-                        result.close()
-                    actual = out.scalar(sa.select(sa.func.count()).select_from(dst))
-                    if actual != copied: raise MigrationError('Contagem de destino divergente; transação revertida.')
+                result = copy_table(source, target, src, dst, job, batch, options, control)
                 loaded.add(dst.name)
-                job['rows'] += copied
-                job['tables'].append({'source': src.fullname, 'target': dst.name, 'copied': copied, 'target_count': actual})
-                record('data', dst.name, dst.name, 'copied', f'{copied} registros confirmados; contagem do destino: {actual}.', rows=copied)
+                job['tables'].append(result)
+                message = f"{result['copied']} registros confirmados. " + (f"Contagem no destino: {result['target_count']}." if result['target_count'] is not None else 'COUNT(*) dispensado por opção; validação limitada aos COMMITs.')
+                record('data', dst.name, dst.name, 'copied', message, rows=result['copied'])
+            except MigrationCancelled:
+                record('data', dst.name, dst.name, 'cancelled', 'Carga cancelada; transação pendente revertida. COMMITs anteriores, se houver, permanecem. Confira métricas e destino.')
+                raise
             except Exception as exc: failure(exc, 'data', dst.name, dst.name)
             finally: job['rows_in_flight'] = 0
         for _, dst in pairs:
             for index in sorted(dst.indexes, key=lambda i: i.name):
+                control.checkpoint(job)
+                activity(job, f'Criando/verificando índice {index.name}')
                 if dst.name not in loaded:
                     record('index', index.name, dst.name, 'skipped', 'Tabela sem carga confirmada nesta execução.'); continue
                 job['stage'] = f'Criar índice {index.name}'
@@ -371,6 +353,8 @@ def execute(source, target, prepared, job, batch, existing_policy='abort', conti
                 except Exception as exc: failure(exc, 'index', index.name, dst.name)
         for _, dst in pairs:
             for fk in sorted(dst.foreign_key_constraints, key=lambda f: f.name):
+                control.checkpoint(job)
+                activity(job, f'Criando/verificando FK {fk.name}')
                 references = {element.column.table.name for element in fk.elements}
                 if dst.name not in loaded or not references.issubset(loaded):
                     record('foreign_key', fk.name, dst.name, 'skipped', 'FK omitida: tabela dependente ou referenciada pulada/sem carga confirmada. Revisão manual necessária.'); continue
@@ -382,19 +366,23 @@ def execute(source, target, prepared, job, batch, existing_policy='abort', conti
         has_errors = any(e['status'] == 'failed' for e in job['events'])
         has_warnings = any(e['status'] == 'skipped' or e.get('warnings') for e in job['events'])
         status = 'completed_with_errors' if has_errors else 'completed_with_warnings' if has_warnings else 'completed'
-        job.update(status=status, stage='Processamento encerrado. Confira resultados por objeto e pendências manuais.')
+        with control.condition:
+            if control.cancelled: raise MigrationCancelled('Cancelamento solicitado.')
+            job.update(status=status, stage='Processamento encerrado. Confira resultados por objeto e pendências manuais.')
+    except MigrationCancelled:
+        with control.condition: job.update(status='cancelled', stage='Cancelado. Transações anteriores permanecem; revise tabelas parciais antes de repetir.')
     except Exception as exc:
         detail = diagnostic(exc, job.get('stage', 'Preparação'), None, (source, target), hide_values=True)
         if not any(e['status'] == 'failed' for e in job['events']):
             record('execution', job.get('stage', 'Preparação'), '', 'failed', detail['message'], diagnostic=detail)
-        job.update(status='failed', error=detail['message'], diagnostic=detail, stage='Migração interrompida; confira o relatório.')
+        with control.condition: job.update(status='failed', error=detail['message'], diagnostic=detail, stage='Migração interrompida; confira o relatório.')
     finally:
-        if job['status'] == 'failed':
+        if job['status'] in ('failed', 'cancelled'):
             attempted = {(e['kind'], e['table'], e['object']) for e in job['events']}
             for _, dst in pairs:
                 pending = [('table', dst.name), ('data', dst.name)] + [('index', i.name) for i in dst.indexes] + [('foreign_key', f.name) for f in dst.foreign_key_constraints]
                 for kind, name in pending:
                     if (kind, dst.name, name) not in attempted:
                         record(kind, name, dst.name, 'skipped', 'Não executado: processamento interrompido. Verifique o destino antes de repetir.')
-        job['summary'] = {status: sum(e['status'] == status for e in job['events']) for status in ('created', 'copied', 'skipped', 'failed')}
+        job['summary'] = {status: sum(e['status'] == status for e in job['events']) for status in ('created', 'copied', 'skipped', 'failed', 'cancelled') if status != 'cancelled' or any(e['status'] == 'cancelled' for e in job['events'])}
         job['finished_at'] = datetime.now(timezone.utc).isoformat()

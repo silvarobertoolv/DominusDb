@@ -14,6 +14,7 @@ MYSQL_HINTS = {
     1071: ('limite de índice', 'A chave excede o limite em bytes do MySQL. Revise tipo, tamanho e charset.'),
     1118: ('limite de linha', 'A linha excede o limite do InnoDB. Considere TEXT/BLOB ou reduzir VARCHARs.'),
     1142: ('permissão', 'Conceda CREATE, INSERT, ALTER, INDEX, SELECT e REFERENCES conforme a operação.'),
+    1153: ('registro/pacote muito grande', 'Reduza o lote; se uma única linha exceder max_allowed_packet, ajuste o limite do MySQL após avaliação.'),
     1170: ('índice incompatível', 'TEXT/BLOB exige prefixo de índice. Revise o tipo ou adapte o índice manualmente.'),
     1215: ('relacionamento incompatível', 'Confira tipos, índices, collation e tabela referenciada.'),
     1264: ('valor fora do intervalo', 'Revise o tamanho e o sinal do tipo numérico.'),

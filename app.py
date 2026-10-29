@@ -1,5 +1,6 @@
 import io
 import json
+from datetime import datetime, timezone
 import secrets
 import threading
 import zipfile
@@ -10,11 +11,12 @@ from sqlalchemy.engine import URL
 from migration import inventory, plan, execute, PlanError, destination_objects
 from diagnostics import diagnostic
 from type_mapping import TYPE_EXAMPLES
+from transfer import TransferControl, WarningTrackingCursor
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
 app.config.update(MAX_CONTENT_LENGTH=1024*1024, SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Strict', TRUSTED_HOSTS=['127.0.0.1', 'localhost', '[::1]'])
-state = {'source': None, 'target': None, 'plan': None, 'job': None}
+state = {'source': None, 'target': None, 'plan': None, 'job': None, 'control': None}
 lock = threading.RLock()
 
 
@@ -31,7 +33,7 @@ def idle(fn):
     @wraps(fn)
     def wrapped(*args, **kwargs):
         with lock:
-            if state['job'] and state['job']['status'] in ('queued', 'running'): return error('Aguarde a migração em andamento.', 409)
+            if state['job'] and state['job']['status'] in ('queued', 'running', 'pause_requested', 'paused', 'cancelling'): return error('Aguarde a migração em andamento.', 409)
             return fn(*args, **kwargs)
     return wrapped
 
@@ -39,10 +41,12 @@ def idle(fn):
 def engine_for(data, kind):
     port = int(data.get('port') or (1433 if kind == 'source' else 3306))
     if not 1 <= port <= 65535: raise ValueError('Porta inválida.')
+    query_timeout = int(data.get('query_timeout') or 300)
+    if not 10 <= query_timeout <= 3600: raise ValueError('Timeout deve ser entre 10 e 3600 segundos.')
     for key in ('host', 'database', 'user'):
         if not isinstance(data.get(key), str) or not data[key].strip(): raise ValueError(f'Preencha {key}.')
     url = URL.create('mssql+pymssql' if kind == 'source' else 'mysql+pymysql', username=data['user'], password=data.get('password', ''), host=data['host'].strip(), port=port, database=data['database'])
-    args = {'login_timeout': 10, 'timeout': 60, 'charset': 'UTF-8', 'encryption': 'require' if data.get('tls', True) else 'off', 'tds_version': '7.3', 'use_datetime2': True} if kind == 'source' else {'connect_timeout': 10, 'read_timeout': 60, 'write_timeout': 60, 'charset': 'utf8mb4'}
+    args = {'login_timeout': 10, 'timeout': query_timeout, 'charset': 'UTF-8', 'encryption': 'require' if data.get('tls', True) else 'off', 'tds_version': '7.3', 'use_datetime2': True} if kind == 'source' else {'connect_timeout': 10, 'read_timeout': query_timeout, 'write_timeout': query_timeout, 'charset': 'utf8mb4', 'cursorclass': WarningTrackingCursor}
     if kind == 'target' and data.get('tls'):
         args['ssl'] = {'check_hostname': True}
         args['ssl_verify_cert'] = True
@@ -130,21 +134,76 @@ def run():
     if prepared['errors']: return error('O plano contém bloqueios de conversão.')
     if state['target'] is None: return error('Conecte o destino primeiro.')
     if data.get('confirmation') != 'MIGRAR': return error('Digite MIGRAR para confirmar a criação dos objetos no destino.')
+    if isinstance(data.get('batch'), bool): return error('Lote inválido.')
     try: batch = int(data.get('batch', 1000))
     except (ValueError, TypeError): return error('Lote inválido.')
-    if not 1 <= batch <= 10000: return error('O lote deve ter entre 1 e 10000 linhas.')
+    if not 1 <= batch <= 50000: return error('O lote deve ter entre 1 e 50000 linhas.')
     existing_policy = data.get('existing_policy', 'abort')
     continue_on_error = data.get('continue_on_error', True)
     if existing_policy not in ('abort', 'skip'): return error('Política de objetos existentes inválida.')
     if not isinstance(continue_on_error, bool): return error('Opção de continuar após erros deve ser booleana.')
-    job = {'plan_id': prepared['id'], 'plan_warnings': prepared.get('warnings', []), 'compatibility': prepared.get('compatibility'), 'manual_mappings': prepared.get('manual_mappings', {}), 'status': 'queued', 'rows': 0, 'logs': [], 'tables': [], 'stage': 'Preparando'}
+    transaction_mode = data.get('transaction_mode', 'table')
+    verify_count = data.get('verify_count', True)
+    max_batch_mb = data.get('max_batch_mb', 8)
+    if transaction_mode not in ('table', 'batch'): return error('Modo de transação inválido.')
+    if not isinstance(verify_count, bool): return error('Opção de contagem deve ser booleana.')
+    if isinstance(max_batch_mb, bool) or not isinstance(max_batch_mb, int) or not 1 <= max_batch_mb <= 64: return error('Limite do lote deve ser entre 1 e 64 MiB.')
+    options = dict(transaction_mode=transaction_mode, verify_count=verify_count, max_batch_mb=max_batch_mb)
+    control = TransferControl(batch)
+    job = {'id': secrets.token_hex(12), 'control_history': [], 'plan_id': prepared['id'], 'plan_warnings': prepared.get('warnings', []), 'compatibility': prepared.get('compatibility'), 'manual_mappings': prepared.get('manual_mappings', {}), 'status': 'queued', 'rows': 0, 'logs': [], 'tables': [], 'stage': 'Preparando'}
     state['job'] = job
-    threading.Thread(target=execute, args=(state['source'], state['target'], prepared, job, batch, existing_policy, continue_on_error), daemon=True).start()
+    state['control'] = control
+    threading.Thread(target=execute, args=(state['source'], state['target'], prepared, job, batch, existing_policy, continue_on_error, options, control), daemon=True).start()
     return jsonify(ok=True)
 
 
 @app.get('/api/job')
-def job_status(): return jsonify(state['job'] or {'status': 'idle'})
+def job_status():
+    job = state['job']
+    if not job: return jsonify(status='idle')
+    try: after = int(request.args.get('after', 0))
+    except ValueError: return error('Cursor inválido.')
+    if after < 0: return error('Cursor inválido.')
+    # Keep large schema dictionaries and repeated SHOW CREATE responses out of polling.
+    fields = ('id', 'status', 'stage', 'activity', 'activity_started_at', 'rows', 'rows_in_flight',
+              'table_progress', 'started_at', 'finished_at', 'summary', 'error', 'diagnostic', 'options')
+    result = {k: job[k] for k in fields if k in job}
+    events = list(job.get('events', []))
+    if 'table_progress' in result: result['table_progress'] = [dict(item) for item in list(result['table_progress'])]
+    result.update(events=events[after:after+200], next_cursor=min(len(events), after+200),
+                  events_total=len(events), logs=job.get('logs', [])[-30:])
+    now = datetime.now(timezone.utc)
+    for key, field in (('elapsed_seconds', 'started_at'), ('activity_seconds', 'activity_started_at')):
+        stamp = job.get(field)
+        if stamp:
+            end = datetime.fromisoformat(job.get('finished_at') or now.isoformat())
+            result[key] = max(0., (end - datetime.fromisoformat(stamp)).total_seconds())
+    return jsonify(result)
+
+
+@app.post('/api/job/control')
+def job_control():
+    with lock:
+        data = request.get_json() or {}
+        job, control = state['job'], state['control']
+        if not job or not control: return error('Nenhuma migração ativa.', 409)
+        with control.condition:
+            active = ('queued', 'running', 'pause_requested', 'paused', 'cancelling')
+            if job['status'] not in active: return error('Nenhuma migração ativa.', 409)
+            if data.get('job_id') != job.get('id'): return error('Execução desatualizada.', 409)
+            action = data.get('action')
+            if action not in ('pause', 'resume', 'cancel', 'tune'): return error('Ação inválida.')
+            batch = data.get('batch')
+            if action == 'tune' and (isinstance(batch, bool) or not isinstance(batch, int) or not 1 <= batch <= 50000): return error('Lote deve ser entre 1 e 50000 linhas.')
+            if action != 'tune': batch = None
+            if job['status'] == 'cancelling': return error('Cancelamento já solicitado.', 409)
+            if action == 'pause': job['status'] = 'pause_requested'
+            elif action == 'resume': job['status'] = 'running'
+            elif action == 'cancel': job['status'] = 'cancelling'
+            control.request(action, batch)
+            job.setdefault('control_history', []).append(dict(action=action, batch=batch, at=datetime.now(timezone.utc).isoformat()))
+            if batch is not None: job.setdefault('options', {})['batch'] = batch
+            return jsonify(ok=True, message='Solicitação recebida. Operações SQL em andamento terminam antes do próximo ponto de controle.')
 
 
 @app.get('/api/report')

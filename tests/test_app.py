@@ -85,7 +85,7 @@ def test_run_passes_skip_and_continue_options_to_worker(client, monkeypatch):
     monkeypatch.setattr(module.threading,'Thread',Thread)
     response=post(client,'/api/run',{'plan_id':'current','confirmation':'MIGRAR','existing_policy':'skip','continue_on_error':True,'batch':500})
     assert response.status_code==200 and captured['started']
-    assert captured['args'][-3:]==(500,'skip',True)
+    assert captured['args'][4:7]==(500,'skip',True)
 
 
 @pytest.mark.parametrize('options',[{'existing_policy':'drop'},{'continue_on_error':'false'}])
@@ -150,3 +150,44 @@ def test_manual_mapping_can_unblock_plan_and_run_without_accepting_stale_id(clie
     assert response.status_code==200
     assert captured['plan']['pairs'][0][1].c.problem.type.length==100
     assert state['job']['manual_mappings']==corrected['manual_mappings']
+
+
+@pytest.mark.parametrize('status',['paused','pause_requested','cancelling'])
+def test_mutations_remain_locked_while_job_paused_or_cancelling(client,status):
+    state['job']={'status':status}
+    assert post(client,'/api/inventory').status_code==409
+
+
+def test_job_controls_validate_csrf_job_id_and_tuning(client):
+    from transfer import TransferControl
+    state.update(job=dict(id='run1',status='running'),control=TransferControl(100))
+    assert client.post('/api/job/control',json=dict(job_id='run1',action='pause')).status_code==403
+    assert post(client,'/api/job/control',dict(job_id='old',action='cancel')).status_code==409
+    assert post(client,'/api/job/control',dict(job_id='run1',action='pause')).status_code==200
+    assert state['control'].paused and state['job']['status']=='pause_requested'
+    assert post(client,'/api/job/control',dict(job_id='run1',action='tune',batch=20000)).status_code==200
+    assert state['control'].batch==20000
+    assert post(client,'/api/job/control',dict(job_id='run1',action='tune',batch=50001)).status_code==400
+    assert post(client,'/api/job/control',dict(job_id='run1',action='resume')).status_code==200
+    assert not state['control'].paused
+    assert post(client,'/api/job/control',dict(job_id='run1',action='cancel')).status_code==200
+    assert state['control'].cancelled and state['job']['status']=='cancelling'
+
+
+def test_polling_is_incremental_and_omits_large_schema_report(client):
+    state['job']=dict(id='j',status='running',compatibility={'huge':'schema'},manual_mappings={},events=[{'object':str(i)} for i in range(250)],logs=['x']*500)
+    first=client.get('/api/job?after=0').get_json()
+    assert len(first['events'])==200 and first['next_cursor']==200
+    assert first['events_total']==250 and 'compatibility' not in first
+    assert len(first['logs'])==30
+    second=client.get('/api/job?after=200').get_json()
+    assert len(second['events'])==50 and second['events'][0]['object']=='200'
+    assert client.get('/api/job?after=-1').status_code==400
+    assert client.get('/api/job?after=invalid').status_code==400
+
+
+@pytest.mark.parametrize('options',[{'transaction_mode':'invalid'},{'verify_count':'yes'},{'max_batch_mb':0},{'max_batch_mb':100},{'batch':True}])
+def test_invalid_performance_options_do_not_start_worker(client,options):
+    state.update(source=object(),target=object(),plan=dict(id='p',errors=[]))
+    assert post(client,'/api/run',dict(plan_id='p',confirmation='MIGRAR',**options)).status_code==400
+    assert state['job'] is None
