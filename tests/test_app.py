@@ -117,7 +117,7 @@ def test_plan_api_and_zip_include_adapted_ddl_and_dictionary(client, monkeypatch
     data=response.get_json()
     assert data['compatibility']['changes'] and not data['errors']
     assert 'TEXT' in data['ddl'] and 'ROW_FORMAT=DYNAMIC' in data['ddl']
-    assert data['destination_check']==[dict(table='main__wide',exists=False)]
+    assert data['destination_check']==[dict(table='wide',exists=False)]
     archive=zipfile.ZipFile(io.BytesIO(client.get('/api/export').data))
     report=json.loads(archive.read('compatibilidade.json'))
     assert report['changes']==data['compatibility']['changes']

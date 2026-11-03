@@ -46,6 +46,18 @@ def identifier(schema, name, kind='mysql'):
     return raw if len(encoded) <= limit else encoded[:limit-13].decode('utf-8', errors='ignore') + '_' + hashlib.sha256(encoded).hexdigest()[:12]
 
 
+def table_identifier(name, kind='mysql', limit=None):
+    """Preserve the unqualified source name; shorten only beyond target limits."""
+    if limit is None: limit = {'mysql': 64, 'postgresql': 63, 'oracle': 30}[kind]
+    encoded = name.encode('utf-8')
+    # MySQL measures identifiers in characters; PostgreSQL/Oracle use bytes.
+    length = len(name) if kind == 'mysql' else len(encoded)
+    if length <= limit:
+        return name
+    prefix = name[:limit-13] if kind == 'mysql' else encoded[:limit-13].decode('utf-8', errors='ignore')
+    return prefix + '_' + hashlib.sha256(encoded).hexdigest()[:12]
+
+
 def convert_native_type(t, kind):
     name = type(t).__name__.upper()
     name = {'BIGINTEGER':'BIGINT', 'SMALLINTEGER':'SMALLINT', 'INT':'INTEGER', 'DOUBLE_PRECISION':'DOUBLE'}.get(name,name)
@@ -99,6 +111,11 @@ def target_limits(engine=None, kind='mysql'):
                     limits['index_bytes']=max(512,int(row['block_size'])//3-128)
                     if row['encoding']!='UTF8': warnings.append('Destino PostgreSQL não usa UTF8; valide a representação dos caracteres da origem.')
                 else:
+                    # The initialized oracledb dialect detects the server's
+                    # effective limit (including COMPATIBLE) on connection.
+                    detected = getattr(engine.dialect, 'max_identifier_length', None)
+                    if getattr(engine.dialect, 'server_version_info', None) and detected in (30, 128):
+                        limits['identifier_bytes'] = detected
                     rows=conn.execute(sa.text("SELECT parameter, value FROM nls_database_parameters WHERE parameter IN ('NLS_CHARACTERSET','NLS_NCHAR_CHARACTERSET')")).all()
                     nls=dict(rows)
                     limits.update(charset=nls.get('NLS_CHARACTERSET','desconhecido'),national_charset=nls.get('NLS_NCHAR_CHARACTERSET','desconhecido'),verified=bool(rows),version='.'.join(map(str,getattr(engine.dialect,'server_version_info',None) or ())))
@@ -111,7 +128,7 @@ def target_limits(engine=None, kind='mysql'):
             warnings.append('Limites do destino não confirmados: '+diagnostic(exc,'Consultar limites de '+KINDS[kind],engines=(engine,))['message'])
     if not limits['verified']: warnings.append(f'{KINDS[kind]}: estimativas conservadoras assumidas; valide versão, encoding e limites com o destino conectado.')
     if kind=='oracle':
-        warnings += ['Oracle: nomes gerados limitados a 30 bytes; VARCHAR2/RAW usam limites STANDARD. Nenhum parâmetro do servidor é alterado.',
+        warnings += [f'Oracle: nomes de tabelas/colunas limitados a {limits["identifier_bytes"]} bytes; índices/constraints usam até 30 bytes. VARCHAR2/RAW usam limites STANDARD. Nenhum parâmetro do servidor é alterado.',
                      'Oracle trata string vazia como NULL. Por padrão a carga interrompe; se permitido pelo negócio, escolha Converter textos vazios para NULL (somente colunas textuais que aceitem NULL). Binários vazios continuam exigindo tratamento específico.',
                      'Oracle: TIME torna-se INTERVAL DAY TO SECOND (dias=0). Revise consultas e regras que esperem um tipo hora.']
     else:

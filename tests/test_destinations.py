@@ -73,7 +73,7 @@ def test_plan_uses_correct_ddl_and_compatibility_rules(monkeypatch,kind):
     else:
         assert 'ENGINE=' not in result['ddl'] and 'utf8mb4' not in result['ddl'] and 'ROW_FORMAT' not in result['ddl']
         assert not result['compatibility']['changes']
-    if kind=='postgresql':assert 'public.main__parent' in result['ddl'] and 'VARCHAR(4000)' in result['ddl']
+    if kind=='postgresql':assert 'public.parent' in result['ddl'] and 'VARCHAR(4000)' in result['ddl']
     if kind=='oracle':assert 'NCLOB' in result['ddl'] and 'NUMBER(19, 0)' in result['ddl']
 
 

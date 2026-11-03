@@ -35,7 +35,6 @@ def engine_for(data, kind):
     else:
         args=dict(tcp_connect_timeout=10)
         if data.get('tls'):args.update(protocol='tcps',ssl_server_dn_match=True)
-        extra['max_identifier_length']=30
     engine=sa.create_engine(url,connect_args=args,pool_pre_ping=True,hide_parameters=True,echo=False,**extra)
     if destination=='mssql': engine._sqlbridge_metadata_mode=mode
     schema=data.get('schema','').strip() if kind=='target' else ''

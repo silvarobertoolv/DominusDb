@@ -4,7 +4,7 @@ from type_mapping import parse_target_type, validate_overrides
 from transfer import copy_table, TransferControl, MigrationCancelled, activity
 from compatibility import source_dictionary
 from source_catalog import source_inspector, reflect_source_table
-from target_profiles import destination_kind, destination_schema, dialect_for, identifier, convert_native_type, target_limits, check_and_adapt, KINDS
+from target_profiles import destination_kind, destination_schema, dialect_for, identifier, table_identifier, convert_native_type, target_limits, check_and_adapt, KINDS
 from datetime import datetime, timezone
 import sqlalchemy as sa
 from sqlalchemy.dialects import mysql, mssql
@@ -12,7 +12,7 @@ from sqlalchemy.schema import CreateTable, AddConstraint, CreateIndex
 
 
 def target_name(schema, name):
-    return identifier(schema, name, 'mysql')
+    return table_identifier(name, 'mysql')
 
 def convert_type(t, kind="mysql"):
     if kind != "mysql": return convert_native_type(t, kind)
@@ -109,6 +109,17 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
     available = {t['id']: t for t in catalog['tables']}
     if not selected or len(selected) != len(set(selected)) or any(x not in available for x in selected):
         raise ValueError('Selecione tabelas válidas, sem duplicatas.')
+    limits, limit_warnings = target_limits(target, kind)
+    context.update(stage='Definir nomes das tabelas de destino', object=None)
+    table_names, owners = {}, {}
+    for key in selected:
+        name = table_identifier(available[key]['name'], kind, 64 if kind == 'mysql' else limits['identifier_bytes'])
+        previous = owners.get(name.casefold())
+        if previous is not None:
+            raise ValueError(f'Colisão de nomes em {label}: {previous} e {key} resultam em {name}. '
+                             'O schema de origem não compõe o nome no destino. Renomeie uma das tabelas de origem ou migre-as para destinos separados.')
+        owners[name.casefold()] = key
+        table_names[key] = name
     overrides = overrides or {}
     unknown = set(overrides) - set(selected)
     if unknown: raise ValueError('Mapeamento aponta para tabela fora da seleção: ' + ', '.join(sorted(unknown)))
@@ -117,8 +128,10 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
     destination = sa.MetaData()
     pairs, warnings, errors = [], [], []
     dictionary = []
-    limits, limit_warnings = target_limits(target, kind)
     warnings.extend(limit_warnings)
+    for key, name in table_names.items():
+        if name != available[key]['name']:
+            warnings.append(f'{key}: nome da tabela abreviado para {name} para respeitar o limite do perfil {label}; sufixo hash mantém a abreviação estável.')
     for key in selected:
         item = available[key]
         context.update(stage='Refletir colunas, PKs e relacionamentos', object=key)
@@ -171,7 +184,7 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
                 entry['error'] = str(exc)
                 errors.append(f'{key}.{col.name}: {exc}')
         table_options = dict(mysql_engine='InnoDB', mysql_charset='utf8mb4', mysql_collate='utf8mb4_bin') if kind == 'mysql' else dict(schema=schema)
-        dst = sa.Table(named(item['schema'], item['name']), destination, *columns, **table_options)
+        dst = sa.Table(table_names[key], destination, *columns, **table_options)
         pk_order=[c.name for c in src.primary_key.columns]
         if pk_order and all(name in dst.c for name in pk_order): dst.append_constraint(sa.PrimaryKeyConstraint(*pk_order))
         pairs.append((src, dst))
@@ -235,6 +248,8 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
             entry['target_type'] = str(dst.c[entry['column']].type.compile(dialect=dialect))
     compatibility['target_kind'] = kind
     compatibility['target_schema'] = schema
+    compatibility['table_names'] = [{'source': src.fullname, 'target': dst.name, 'target_schema': dst.schema,
+                                     'abbreviated': src.name != dst.name} for src, dst in pairs]
     warnings.extend(compatibility.get('warnings', []))
     compatibility['source_dictionary'] = dictionary
     compatibility['source_reflection'] = [{'table': src.fullname, 'mode': src.info.get('reflection_mode','sqlalchemy'), 'fallback_code': src.info.get('reflection_fallback_code')} for src,_ in pairs]

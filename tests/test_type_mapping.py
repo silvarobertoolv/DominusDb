@@ -83,4 +83,4 @@ def test_manual_type_flows_into_real_creation_and_batch_copy(monkeypatch):
     job={}
     migration.execute(engine,target,prepared,job,100)
     assert job['status']=='completed' and job['rows']==1
-    with target.connect() as conn:assert conn.exec_driver_sql('SELECT problem FROM main__t').scalar()=='Olá'
+    with target.connect() as conn:assert conn.exec_driver_sql('SELECT problem FROM t').scalar()=='Olá'

@@ -15,8 +15,8 @@ def test_unsupported_type_is_blocked():
 
 
 def test_names_have_stable_hash_and_do_not_exceed_mysql_limit():
-    a=target_name('s'*70,'t'); b=target_name('s'*70,'u')
-    assert len(a)==64 and a!=b and a==target_name('s'*70,'t')
+    a=target_name('dbo','t'*70); b=target_name('dbo','u'*70)
+    assert len(a)==64 and a!=b and a==target_name('other_schema','t'*70)
 
 
 def pair():
