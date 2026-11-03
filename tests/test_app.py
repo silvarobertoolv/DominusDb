@@ -124,6 +124,37 @@ def test_plan_api_and_zip_include_adapted_ddl_and_dictionary(client, monkeypatch
     assert report['source_dictionary'][0]['table']=='main.wide'
 
 
+def test_plan_case_option_flows_into_ddl_export_and_existing_object_check(client, monkeypatch):
+    import sqlalchemy as sa
+    import migration
+    import io, json, zipfile
+    source = sa.create_engine('sqlite://')
+    sa.Table('Clientes', sa.MetaData(schema='main'), sa.Column('codigo', sa.Integer)).create(source)
+    target = sa.create_engine('sqlite://')
+    sa.Table('CLIENTES', sa.MetaData(), sa.Column('codigo', sa.Integer)).create(target)
+    state.update(source=source, target=target)
+    monkeypatch.setattr(migration, 'inventory', lambda _: dict(tables=[dict(
+        id='main.Clientes', schema='main', name='Clientes')], objects=[]))
+    initial = post(client, '/api/plan', dict(tables=['main.Clientes'])).get_json()
+    assert initial['table_name_case'] == 'preserve'
+    assert initial['tables'][0]['target'] == 'Clientes'
+    response = post(client, '/api/plan', dict(tables=['main.Clientes'], table_name_case='upper'))
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data['table_name_case'] == 'upper'
+    assert data['tables'][0]['target'] == 'CLIENTES'
+    assert 'CREATE TABLE `CLIENTES`' in data['ddl']
+    assert data['destination_check'] == [dict(table='CLIENTES', exists=True)]
+    archive = zipfile.ZipFile(io.BytesIO(client.get('/api/export').data))
+    report = json.loads(archive.read('compatibilidade.json'))
+    assert report['table_name_case'] == 'upper'
+    assert report['table_names'][0]['abbreviated'] is False
+    assert post(client, '/api/run', dict(plan_id=initial['id'], confirmation='MIGRAR')).status_code == 400
+    response = post(client, '/api/plan', dict(tables=['main.Clientes'], table_name_case='invalid'))
+    assert response.status_code == 400 and state['plan'] is None
+    assert 'Padrão dos nomes' in response.get_json()['error']
+
+
 def test_manual_mapping_can_unblock_plan_and_run_without_accepting_stale_id(client, monkeypatch):
     import sqlalchemy as sa
     import migration

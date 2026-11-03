@@ -93,7 +93,7 @@ def make_plan():
     try:
         selected = (request.get_json() or {}).get('tables')
         if not isinstance(selected, list) or not all(isinstance(x, str) for x in selected): return error('Seleção inválida.')
-        prepared = plan(state['source'], selected, state['target'], (request.get_json() or {}).get('overrides'), (request.get_json() or {}).get('target_kind'))
+        prepared = plan(state['source'], selected, state['target'], (request.get_json() or {}).get('overrides'), (request.get_json() or {}).get('target_kind'), (request.get_json() or {}).get('table_name_case', 'preserve'))
         prepared['id'] = secrets.token_urlsafe(24)
         prepared['destination_check'] = []
         if state['target'] is not None:
@@ -103,7 +103,7 @@ def make_plan():
             except Exception as exc:
                 detail = diagnostic(exc, 'Inspecionar destino', engines=(state['target'],))
                 prepared['warnings'].append(f"Não foi possível inspecionar o destino: {detail['message']}. A execução fará nova verificação.")
-        response = jsonify(target_kind=prepared.get('target_kind','mysql'), target_schema=prepared.get('target_schema'), type_examples=TYPE_EXAMPLES_BY_KIND[prepared.get('target_kind','mysql')], column_mappings=prepared.get('column_mappings', []), manual_mappings=prepared.get('manual_mappings', {}), compatibility=prepared.get('compatibility'), destination_check=prepared['destination_check'], id=prepared['id'], ddl=prepared['ddl'], warnings=prepared['warnings'], errors=prepared['errors'], objects=prepared['objects'], tables=[{'source': s.fullname, 'target': d.name, 'columns': [{'name': c.name, 'type': str(c.type.compile(dialect=dialect_for(prepared.get('target_kind','mysql'))))} for c in d.columns]} for s,d in prepared['pairs']])
+        response = jsonify(table_name_case=prepared.get('table_name_case','preserve'), target_kind=prepared.get('target_kind','mysql'), target_schema=prepared.get('target_schema'), type_examples=TYPE_EXAMPLES_BY_KIND[prepared.get('target_kind','mysql')], column_mappings=prepared.get('column_mappings', []), manual_mappings=prepared.get('manual_mappings', {}), compatibility=prepared.get('compatibility'), destination_check=prepared['destination_check'], id=prepared['id'], ddl=prepared['ddl'], warnings=prepared['warnings'], errors=prepared['errors'], objects=prepared['objects'], tables=[{'source': s.fullname, 'target': d.name, 'columns': [{'name': c.name, 'type': str(c.type.compile(dialect=dialect_for(prepared.get('target_kind','mysql'))))} for c in d.columns]} for s,d in prepared['pairs']])
         state['plan'] = prepared
         return response
     except PlanError as exc: return plan_diagnostic(exc)

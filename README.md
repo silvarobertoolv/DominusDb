@@ -42,7 +42,7 @@ CREATE DATABASE migracao CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
 
 1. Teste e conecte a origem e o destino. As senhas são removidas dos campos após uma conexão bem-sucedida, mas os engines mantêm as credenciais na memória.
 2. Clique em **Ler catálogo** e selecione as tabelas.
-3. Gere o plano. Revise tipos, nomes, DDL, bloqueios e avisos; baixe o ZIP com o plano e as definições originais.
+3. Em **Nomes das tabelas de destino**, escolha **Preservar maiúsculas/minúsculas da origem** (padrão) ou **Converter tudo para MAIÚSCULAS**. Gere o plano. Revise tipos, nomes, DDL, bloqueios e avisos; baixe o ZIP com o plano e as definições originais.
 4. Pause as escritas na origem. Não há snapshot global, CDC nem sincronização incremental: mudanças concorrentes podem produzir uma cópia inconsistente entre tabelas.
 5. Digite **MIGRAR** e execute. O progresso informa linhas confirmadas e linhas da transação em andamento; o relatório confirma linhas efetivamente gravadas por tabela.
 6. Baixe o relatório, valide contagens, valores e regras de negócio. A contagem do destino é comparada às linhas copiadas, sem checksum de conteúdo. Depois adapte e valide os objetos manuais antes de direcionar sua aplicação ao MySQL.
@@ -231,3 +231,5 @@ O monitor e o JSON da execução mostram **empty_to_null_prepared** e **empty_to
 Para tentar novamente após uma falha, revise primeiro as tabelas criadas e os COMMITs existentes. O modo pular preserva tabelas existentes e não completa cargas parciais; use um banco/schema de teste novo ou remova manualmente somente os artefatos da tentativa anterior após avaliação. Não há retomada automática de tabela parcial.
 
 Ao atualizar a regra de nomes, gere um novo plano antes de migrar. Tabelas criadas anteriormente com prefixo de schema não são renomeadas ou removidas automaticamente; confira o destino para evitar uma segunda cópia com o novo nome.
+
+A opção de caixa afeta somente nomes de tabelas no destino: `dbo.Clientes` → `Clientes` ou `CLIENTES`. A conversão para maiúsculas ocorre antes de calcular os limites e abreviar; o sufixo da abreviação também fica em maiúsculas. Colunas e dados mantêm seu comportamento atual. FKs, checagem de objetos existentes e DDL usam os nomes finais. Alterar a opção exige gerar e revisar outro plano; o relatório de compatibilidade registra `table_name_case` e os nomes resultantes. Tabelas existentes não são renomeadas.

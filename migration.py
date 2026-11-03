@@ -91,15 +91,19 @@ class PlanError(Exception):
         super().__init__(f'{stage}: {type(cause).__name__}')
 
 
-def plan(engine, selected, target=None, overrides=None, target_kind=None):
+def plan(engine, selected, target=None, overrides=None, target_kind=None, table_name_case='preserve'):
     context = {'stage': 'Ler catálogo', 'object': None}
     try:
-        return _plan(engine, selected, context, target, validate_overrides(overrides), target_kind)
+        return _plan(engine, selected, context, target, validate_overrides(overrides), target_kind, table_name_case)
     except Exception as exc:
         raise PlanError(context['stage'], context['object'], exc) from exc
 
 
-def _plan(engine, selected, context, target=None, overrides=None, target_kind=None):
+def _plan(engine, selected, context, target=None, overrides=None, target_kind=None, table_name_case='preserve'):
+    context.update(stage='Validar padrão dos nomes de tabelas', object=None)
+    if table_name_case not in ('preserve', 'upper'):
+        raise ValueError('Padrão dos nomes de tabelas inválido. Escolha preservar origem ou maiúsculas.')
+    def case_name(name): return name.upper() if table_name_case == 'upper' else name
     kind = destination_kind(target, target_kind)
     label = KINDS[kind]
     dialect = dialect_for(kind)
@@ -113,7 +117,7 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
     context.update(stage='Definir nomes das tabelas de destino', object=None)
     table_names, owners = {}, {}
     for key in selected:
-        name = table_identifier(available[key]['name'], kind, 64 if kind == 'mysql' else limits['identifier_bytes'])
+        name = case_name(table_identifier(case_name(available[key]['name']), kind, 64 if kind == 'mysql' else limits['identifier_bytes']))
         previous = owners.get(name.casefold())
         if previous is not None:
             raise ValueError(f'Colisão de nomes em {label}: {previous} e {key} resultam em {name}. '
@@ -130,7 +134,7 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
     dictionary = []
     warnings.extend(limit_warnings)
     for key, name in table_names.items():
-        if name != available[key]['name']:
+        if name != case_name(available[key]['name']):
             warnings.append(f'{key}: nome da tabela abreviado para {name} para respeitar o limite do perfil {label}; sufixo hash mantém a abreviação estável.')
     for key in selected:
         item = available[key]
@@ -248,8 +252,9 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
             entry['target_type'] = str(dst.c[entry['column']].type.compile(dialect=dialect))
     compatibility['target_kind'] = kind
     compatibility['target_schema'] = schema
+    compatibility['table_name_case'] = table_name_case
     compatibility['table_names'] = [{'source': src.fullname, 'target': dst.name, 'target_schema': dst.schema,
-                                     'abbreviated': src.name != dst.name} for src, dst in pairs]
+                                     'abbreviated': case_name(src.name) != dst.name} for src, dst in pairs]
     warnings.extend(compatibility.get('warnings', []))
     compatibility['source_dictionary'] = dictionary
     compatibility['source_reflection'] = [{'table': src.fullname, 'mode': src.info.get('reflection_mode','sqlalchemy'), 'fallback_code': src.info.get('reflection_fallback_code')} for src,_ in pairs]
@@ -276,7 +281,7 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
             compile_ddl(CreateIndex(index), f'Compilar índice para {label}', index.name)
         for fk in sorted(d.foreign_key_constraints, key=lambda f: f.name):
             compile_ddl(AddConstraint(fk), f'Compilar FK para {label}', fk.name)
-    return {'target_kind': kind, 'target_schema': schema, 'column_mappings': column_mappings, 'manual_mappings': overrides, 'compatibility': compatibility, 'pairs': pairs, 'ddl': '\n\n'.join(statements), 'warnings': warnings, 'errors': errors, 'objects': catalog['objects']}
+    return {'target_kind': kind, 'target_schema': schema, 'table_name_case': table_name_case, 'column_mappings': column_mappings, 'manual_mappings': overrides, 'compatibility': compatibility, 'pairs': pairs, 'ddl': '\n\n'.join(statements), 'warnings': warnings, 'errors': errors, 'objects': catalog['objects']}
 
 
 class MigrationError(Exception):
