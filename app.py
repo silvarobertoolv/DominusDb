@@ -93,7 +93,7 @@ def make_plan():
     try:
         selected = (request.get_json() or {}).get('tables')
         if not isinstance(selected, list) or not all(isinstance(x, str) for x in selected): return error('Seleção inválida.')
-        prepared = plan(state['source'], selected, state['target'], (request.get_json() or {}).get('overrides'), (request.get_json() or {}).get('target_kind'), (request.get_json() or {}).get('table_name_case', 'preserve'), (request.get_json() or {}).get('column_name_case', 'preserve'), (request.get_json() or {}).get('column_naming', 'preserve'), (request.get_json() or {}).get('nullable_overrides'), (request.get_json() or {}).get('oracle_nullable_text', False))
+        prepared = plan(state['source'], selected, state['target'], (request.get_json() or {}).get('overrides'), (request.get_json() or {}).get('target_kind'), (request.get_json() or {}).get('table_name_case', 'preserve'), (request.get_json() or {}).get('column_name_case', 'preserve'), (request.get_json() or {}).get('column_naming', 'preserve'), (request.get_json() or {}).get('nullable_overrides'), (request.get_json() or {}).get('oracle_nullable_text', False), (request.get_json() or {}).get('foreign_key_policy', 'compatible'))
         prepared['id'] = secrets.token_urlsafe(24)
         prepared['destination_check'] = []
         if state['target'] is not None:
@@ -103,7 +103,7 @@ def make_plan():
             except Exception as exc:
                 detail = diagnostic(exc, 'Inspecionar destino', engines=(state['target'],))
                 prepared['warnings'].append(f"Não foi possível inspecionar o destino: {detail['message']}. A execução fará nova verificação.")
-        response = jsonify(oracle_nullable_text=prepared['compatibility'].get('oracle_nullable_text',False), column_name_case=prepared['compatibility'].get('column_name_case','preserve'), column_naming=prepared['compatibility'].get('column_naming','preserve'), nullable_overrides=prepared['compatibility'].get('nullable_overrides',{}), table_name_case=prepared.get('table_name_case','preserve'), target_kind=prepared.get('target_kind','mysql'), target_schema=prepared.get('target_schema'), type_examples=TYPE_EXAMPLES_BY_KIND[prepared.get('target_kind','mysql')], column_mappings=prepared.get('column_mappings', []), manual_mappings=prepared.get('manual_mappings', {}), compatibility=prepared.get('compatibility'), destination_check=prepared['destination_check'], id=prepared['id'], ddl=prepared['ddl'], warnings=prepared['warnings'], errors=prepared['errors'], objects=prepared['objects'], tables=[{'source': s.fullname, 'target': d.name, 'columns': [{'name': c.name, 'type': str(c.type.compile(dialect=dialect_for(prepared.get('target_kind','mysql'))))} for c in d.columns]} for s,d in prepared['pairs']])
+        response = jsonify(foreign_key_policy=prepared.get('foreign_key_policy','compatible'), oracle_nullable_text=prepared['compatibility'].get('oracle_nullable_text',False), column_name_case=prepared['compatibility'].get('column_name_case','preserve'), column_naming=prepared['compatibility'].get('column_naming','preserve'), nullable_overrides=prepared['compatibility'].get('nullable_overrides',{}), table_name_case=prepared.get('table_name_case','preserve'), target_kind=prepared.get('target_kind','mysql'), target_schema=prepared.get('target_schema'), type_examples=TYPE_EXAMPLES_BY_KIND[prepared.get('target_kind','mysql')], column_mappings=prepared.get('column_mappings', []), manual_mappings=prepared.get('manual_mappings', {}), compatibility=prepared.get('compatibility'), destination_check=prepared['destination_check'], id=prepared['id'], ddl=prepared['ddl'], warnings=prepared['warnings'], errors=prepared['errors'], objects=prepared['objects'], tables=[{'source': s.fullname, 'target': d.name, 'columns': [{'name': c.name, 'type': str(c.type.compile(dialect=dialect_for(prepared.get('target_kind','mysql'))))} for c in d.columns]} for s,d in prepared['pairs']])
         state['plan'] = prepared
         return response
     except PlanError as exc: return plan_diagnostic(exc)
@@ -153,7 +153,7 @@ def job_status():
     except ValueError: return error('Cursor inválido.')
     if after < 0: return error('Cursor inválido.')
     # Keep large schema dictionaries and repeated SHOW CREATE responses out of polling.
-    fields = ('target_kind', 'target_schema', 'id', 'status', 'stage', 'activity', 'activity_started_at', 'rows', 'rows_in_flight',
+    fields = ('referential_integrity', 'target_kind', 'target_schema', 'id', 'status', 'stage', 'activity', 'activity_started_at', 'rows', 'rows_in_flight',
               'table_progress', 'started_at', 'finished_at', 'summary', 'error', 'diagnostic', 'options')
     result = {k: job[k] for k in fields if k in job}
     events = list(job.get('events', []))

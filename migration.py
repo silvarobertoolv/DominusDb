@@ -91,20 +91,21 @@ class PlanError(Exception):
         super().__init__(f'{stage}: {type(cause).__name__}')
 
 
-def plan(engine, selected, target=None, overrides=None, target_kind=None, table_name_case='preserve', column_name_case='preserve', column_naming='preserve', nullable_overrides=None, oracle_nullable_text=False):
+def plan(engine, selected, target=None, overrides=None, target_kind=None, table_name_case='preserve', column_name_case='preserve', column_naming='preserve', nullable_overrides=None, oracle_nullable_text=False, foreign_key_policy='compatible'):
     context = {'stage': 'Ler catálogo', 'object': None}
     try:
-        return _plan(engine, selected, context, target, validate_overrides(overrides), target_kind, table_name_case, column_name_case, column_naming, nullable_overrides, oracle_nullable_text)
+        return _plan(engine, selected, context, target, validate_overrides(overrides), target_kind, table_name_case, column_name_case, column_naming, nullable_overrides, oracle_nullable_text, foreign_key_policy)
     except Exception as exc:
         raise PlanError(context['stage'], context['object'], exc) from exc
 
 
-def _plan(engine, selected, context, target=None, overrides=None, target_kind=None, table_name_case='preserve', column_name_case='preserve', column_naming='preserve', nullable_overrides=None, oracle_nullable_text=False):
+def _plan(engine, selected, context, target=None, overrides=None, target_kind=None, table_name_case='preserve', column_name_case='preserve', column_naming='preserve', nullable_overrides=None, oracle_nullable_text=False, foreign_key_policy='compatible'):
     context.update(stage='Validar padrão dos nomes de tabelas', object=None)
     if table_name_case not in ('preserve', 'upper'):
         raise ValueError('Padrão dos nomes de tabelas inválido. Escolha preservar origem ou maiúsculas.')
     if column_name_case not in ('preserve', 'upper') or column_naming not in ('preserve', 'normalize'):
         raise ValueError('Padrão dos nomes de colunas inválido.')
+    if foreign_key_policy not in ('compatible','strict','omit'): raise ValueError('Política de constraints/FKs inválida.')
     if not isinstance(oracle_nullable_text, bool): raise ValueError('Opção Oracle de nulabilidade textual deve ser booleana.')
     if nullable_overrides is None: nullable_overrides = {}
     if not isinstance(nullable_overrides, dict) or any(not isinstance(k, str) or not isinstance(v, list) or any(not isinstance(c, str) for c in v) for k,v in nullable_overrides.items()):
@@ -137,6 +138,7 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
     unknown = set(overrides) - set(selected)
     if unknown: raise ValueError('Mapeamento aponta para tabela fora da seleção: ' + ', '.join(sorted(unknown)))
     column_mappings = []
+    constraint_report = []
     source = sa.MetaData()
     destination = sa.MetaData()
     pairs, warnings, errors = [], [], []
@@ -241,17 +243,33 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
                 sa.Index(named(dst.name, index['name']), *[dst.c[c] for c in cols], unique=index.get('unique', False))
         context.update(stage='Ler chaves estrangeiras', object=src.fullname)
         for fk in inspector.get_foreign_keys(src.name, schema=src.schema):
+            entry = dict(kind='FOREIGN KEY', table=src.fullname, source_name=fk['name'], target_table=dst.name,
+                         source_columns=fk['constrained_columns'], referred_table=(fk.get('referred_schema') or src.schema)+'.'+fk['referred_table'],
+                         status='planned', reason=None)
+            constraint_report.append(entry)
+            if foreign_key_policy == 'omit':
+                entry.update(status='omitted',reason='Omitida por escolha explícita no plano.')
+                continue
             ref = mapping.get((fk.get('referred_schema') or src.schema, fk['referred_table']))
             if ref is None:
-                warnings.append(f'{src.fullname}: FK {fk["name"]} omitida; tabela referenciada fora da seleção.'); continue
-            if any(c not in dst.c for c in fk['constrained_columns']) or any(c not in ref.c for c in fk['referred_columns']): continue
+                message = f'{src.fullname}: FK {fk["name"]} omitida; tabela referenciada fora da seleção. Selecione também {entry["referred_table"]}.'
+                entry.update(status='blocked' if foreign_key_policy=='strict' else 'omitted',reason=message)
+                (errors if foreign_key_policy=='strict' else warnings).append(message)
+                continue
+            if any(c not in dst.c for c in fk['constrained_columns']) or any(c not in ref.c for c in fk['referred_columns']):
+                message=f'{src.fullname}: FK {fk["name"]} depende de coluna sem mapeamento válido.'
+                errors.append(message);entry.update(status='blocked',reason=message);continue
             options = fk.get('options') or {}
+            entry.update(target_name=named(dst.name, fk['name'] or 'fk'), target_columns=[dst.c[c].name for c in fk['constrained_columns']], referred_columns=[ref.c[c].name for c in fk['referred_columns']], ondelete=options.get('ondelete'), onupdate=options.get('onupdate'))
             if any((options.get(k) or '').upper() == 'SET DEFAULT' for k in ('ondelete', 'onupdate')):
+                entry.update(status='blocked',reason='SET DEFAULT exige adaptação dos defaults.')
                 errors.append(f'{src.fullname}: FK {fk["name"]} usa SET DEFAULT; defaults não são recriados automaticamente no perfil {label}. Revisão manual necessária.'); continue
             if kind == 'oracle':
                 if options.get('onupdate') and options['onupdate'].upper() != 'NO ACTION':
+                    entry.update(status='blocked',reason='Oracle não suporta a ação ON UPDATE da origem.')
                     errors.append(f'{src.fullname}: Oracle não suporta ON UPDATE {options["onupdate"]} na FK {fk["name"]}.'); continue
                 if options.get('ondelete') and options['ondelete'].upper() not in ('NO ACTION','CASCADE','SET NULL'):
+                    entry.update(status='blocked',reason='Ação ON DELETE incompatível com Oracle.')
                     errors.append(f'{src.fullname}: ação ON DELETE incompatível com Oracle.'); continue
                 delete_action=(options.get('ondelete') or '').upper()
                 options = dict(options, onupdate=None, ondelete=delete_action if delete_action not in ('','NO ACTION') else None)
@@ -272,7 +290,8 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
         try:
             checks = inspector.get_check_constraints(src.name, schema=src.schema)
         except NotImplementedError:
-            checks = []  # CHECK definitions are included in the sys.objects export.
+            checks = inspector.catalog.get_check_constraints(src.name, schema=src.schema) if engine.dialect.name == 'mssql' else []
+        constraint_report.extend(dict(kind='CHECK',table=src.fullname,source_name=c.get('name'),target_table=dst.name,status='manual',reason='Expressão T-SQL exige adaptação manual.',definition=c.get('sqltext')) for c in checks)
         if checks: warnings.append(f'{src.fullname}: CHECK constraints exigem adaptação manual.')
     context.update(stage=f'Checar limites e adaptar DDL para {label}', object=None)
     compatibility = check_and_adapt(pairs, limits)
@@ -280,6 +299,15 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
         dst = mapping.get((available[entry['table']]['schema'], available[entry['table']]['name']))
         if entry['error'] is None and dst is not None and entry['column'] in dst.c:
             entry['target_type'] = str(dst.c[entry['column']].type.compile(dialect=dialect))
+    for src,dst in pairs:
+        if len(dst.primary_key.columns):
+            constraint_report.append(dict(kind='PRIMARY KEY',table=src.fullname,target_table=dst.name,status='planned',target_name=dst.primary_key.name,target_columns=[c.name for c in dst.primary_key.columns],phase='create_table'))
+        constraint_report.extend(dict(kind='UNIQUE',table=src.fullname,target_table=dst.name,status='planned',target_name=c.name,target_columns=[col.name for col in c.columns],phase='create_table') for c in dst.constraints if isinstance(c,sa.UniqueConstraint))
+        constraint_report.extend(dict(kind='UNIQUE INDEX',table=src.fullname,target_table=dst.name,status='planned',target_name=i.name,target_columns=[c.name for c in i.columns],phase='after_load') for i in dst.indexes if i.unique)
+    compatibility['constraints'] = dict(foreign_key_policy=foreign_key_policy, objects=constraint_report,
+        order=['Tabelas com PKs/UNIQUEs e NOT NULL efetivo','Carga de todas as tabelas','Índices, inclusive UNIQUEs','FKs com validação dos dados existentes'],
+        note='CHECKs e defaults exigem adaptação manual. Alterações explícitas de nulabilidade continuam válidas.')
+    if foreign_key_policy=='omit': warnings.append('FKs omitidas por escolha explícita. A integridade referencial não será imposta por esta migração; PKs e UNIQUEs continuam incluídas.')
     compatibility['target_kind'] = kind
     compatibility['target_schema'] = schema
     compatibility['table_name_case'] = table_name_case
@@ -299,7 +327,7 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
     for change in compatibility['changes']:
         warnings.append(f"{change['table']}.{change['column']}: {change['before']} → {change['after']} automaticamente. {change['reason']}")
     if kind == 'mysql': warnings.append('DATE/DATETIME: SQL Server pode conter anos anteriores a 1000 que não cabem no intervalo documentado do MySQL. O dicionário não valida os valores; datas não são reescritas automaticamente.')
-    warnings.append('Identity, defaults, expressões calculadas e CHECKs não são recriados. PKs, índices comuns, UNIQUEs e FKs entre tabelas selecionadas são incluídos. Revise diferenças de UNIQUE com NULL, collation e limites de índices do destino.')
+    warnings.append('Identity, defaults, expressões calculadas e CHECKs não são recriados. PKs, índices comuns e UNIQUEs são incluídos; FKs obedecem à política escolhida no plano. Revise diferenças de UNIQUE com NULL, collation e limites de índices do destino.')
     if kind == 'mysql': warnings.append('Collation utf8mb4_bin: ordenação e comparação podem diferir da origem. Revise chaves únicas, texto e regras de negócio.')
     warnings.append('Views, procedures, funções, triggers, sequences e synonyms são exportados para revisão; não executados automaticamente.')
     statements = []
@@ -317,7 +345,7 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
             compile_ddl(CreateIndex(index), f'Compilar índice para {label}', index.name)
         for fk in sorted(d.foreign_key_constraints, key=lambda f: f.name):
             compile_ddl(AddConstraint(fk), f'Compilar FK para {label}', fk.name)
-    return {'target_kind': kind, 'target_schema': schema, 'table_name_case': table_name_case, 'column_mappings': column_mappings, 'manual_mappings': overrides, 'compatibility': compatibility, 'pairs': pairs, 'ddl': '\n\n'.join(statements), 'warnings': warnings, 'errors': errors, 'objects': catalog['objects']}
+    return {'foreign_key_policy': foreign_key_policy, 'target_kind': kind, 'target_schema': schema, 'table_name_case': table_name_case, 'column_mappings': column_mappings, 'manual_mappings': overrides, 'compatibility': compatibility, 'pairs': pairs, 'ddl': '\n\n'.join(statements), 'warnings': warnings, 'errors': errors, 'objects': catalog['objects']}
 
 
 class MigrationError(Exception):
@@ -345,6 +373,10 @@ def _create_object_impl(target, element, kind, table, name, context):
     """Return server warnings and metadata verification after committed DDL."""
     result = {'message': 'DDL executado; COMMIT confirmado.', 'warnings': []}
     with target.connect() as conn:
+        if kind == 'foreign_key' and target.dialect.name == 'mysql':
+            conn.exec_driver_sql('SET SESSION foreign_key_checks=1')
+            if conn.exec_driver_sql('SELECT @@SESSION.foreign_key_checks').scalar_one() != 1:
+                raise MigrationError('Validação de FKs não habilitada nesta sessão MySQL.')
         conn.execute(element)
         if target.dialect.name == 'mysql':
             # SHOW WARNINGS must immediately follow the DDL on the same session.
@@ -388,6 +420,12 @@ def execute(source, target, prepared, job, batch, existing_policy='abort', conti
                table_progress=[], paused_seconds=0.,
                started_at=datetime.now(timezone.utc).isoformat())
     pairs = prepared['pairs']
+    foreign_key_policy = prepared.get('foreign_key_policy', 'compatible')
+    planned_fk_count = sum(len(dst.foreign_key_constraints) for _,dst in pairs)
+    constraint_objects = (prepared.get('compatibility') or {}).get('constraints', {}).get('objects', [])
+    omitted_fk_count = sum(c.get('kind')=='FOREIGN KEY' and c.get('status') in ('omitted','blocked') for c in constraint_objects)
+    job['referential_integrity'] = dict(policy=foreign_key_policy, planned=planned_fk_count,
+        created=0, failed=0, skipped=0, not_planned=omitted_fk_count, status='pending')
     created, loaded = set(), set()
 
     def record(kind, name, table, status, message, **extra):
@@ -395,6 +433,9 @@ def execute(source, target, prepared, job, batch, existing_policy='abort', conti
                      at=datetime.now(timezone.utc).isoformat(), **extra)
         job['events'].append(entry)
         job['logs'].append(f'{status.upper()} · {kind} · {name}: {message}')
+        if kind == 'foreign_key' and status in ('created','failed','skipped'):
+            current = job['referential_integrity']
+            job['referential_integrity'] = {**current, status: current[status]+1}
         return entry
 
     def failure(exc, kind, name, table):
@@ -405,15 +446,22 @@ def execute(source, target, prepared, job, batch, existing_policy='abort', conti
             if exc.migration_ddl_committed:
                 detail['hint'] += ' A DDL já teve COMMIT; a falha ocorreu ao verificar metadados. Inspecione o objeto antes de repetir.'
         record(kind, name, table, 'failed', detail['message'], diagnostic=detail, **extra)
-        if not continue_on_error: raise MigrationError(f"{kind} {name}: {detail['category']}. {detail['hint']}") from exc
+        if not continue_on_error or (kind == 'foreign_key' and foreign_key_policy == 'strict'):
+            raise MigrationError(f"{kind} {name}: {detail['category']}. {detail['hint']}") from exc
 
     try:
         control.checkpoint(job)
         if prepared.get('target_kind') and destination_kind(target) != prepared['target_kind']: raise MigrationError('O plano pertence a outro tipo de destino. Gere novamente.')
         if existing_policy not in ('abort', 'skip'): raise MigrationError('Política de objetos existentes inválida.')
+        if foreign_key_policy not in ('compatible','strict','omit'): raise MigrationError('Política de constraints/FKs inválida.')
         if prepared['errors']: raise MigrationError('Plano contém incompatibilidades bloqueantes; revise antes de executar.')
         job['stage'] = 'Verificar objetos existentes no destino'
         existing = destination_objects(target)
+        if foreign_key_policy == 'strict' and existing_policy == 'skip':
+            participating = {t.name.casefold() for _,dst in pairs for fk in dst.foreign_key_constraints for t in [dst, *[e.column.table for e in fk.elements]]}
+            conflicts = existing & participating
+            if conflicts:
+                raise MigrationError('Modo estrito de FKs: tabelas de relacionamentos já existem e seriam puladas: '+', '.join(sorted(conflicts))+'. Use um destino novo; a migração preserva objetos existentes. Nenhuma DDL nova foi executada.')
         if existing_policy == 'abort' and any(d.name.casefold() in existing for _, d in pairs):
             for _, d in pairs:
                 if d.name.casefold() in existing:
@@ -474,6 +522,8 @@ def execute(source, target, prepared, job, batch, existing_policy='abort', conti
                 activity(job, f'Criando/verificando FK {fk.name}')
                 references = {element.column.table.name for element in fk.elements}
                 if dst.name not in loaded or not references.issubset(loaded):
+                    if foreign_key_policy == 'strict':
+                        failure(MigrationError('Modo estrito: FK não aplicada porque uma tabela dependente/referenciada está sem carga confirmada nesta execução.'), 'foreign_key', fk.name, dst.name)
                     record('foreign_key', fk.name, dst.name, 'skipped', 'FK omitida: tabela dependente ou referenciada pulada/sem carga confirmada. Revisão manual necessária.'); continue
                 job['stage'] = f'Criar chave estrangeira {fk.name}'
                 try:
@@ -481,7 +531,7 @@ def execute(source, target, prepared, job, batch, existing_policy='abort', conti
                     record('foreign_key', fk.name, dst.name, 'created', result.pop('message'), **result)
                 except Exception as exc: failure(exc, 'foreign_key', fk.name, dst.name)
         has_errors = any(e['status'] == 'failed' for e in job['events'])
-        has_warnings = any(e['status'] == 'skipped' or e.get('warnings') or e.get('empty_to_null_confirmed') for e in job['events'])
+        has_warnings = bool(omitted_fk_count) or any(e['status'] == 'skipped' or e.get('warnings') or e.get('empty_to_null_confirmed') for e in job['events'])
         status = 'completed_with_errors' if has_errors else 'completed_with_warnings' if has_warnings else 'completed'
         with control.condition:
             if control.cancelled: raise MigrationCancelled('Cancelamento solicitado.')
@@ -502,4 +552,12 @@ def execute(source, target, prepared, job, batch, existing_policy='abort', conti
                     if (kind, dst.name, name) not in attempted:
                         record(kind, name, dst.name, 'skipped', 'Não executado: processamento interrompido. Verifique o destino antes de repetir.')
         job['summary'] = {status: sum(e['status'] == status for e in job['events']) for status in ('created', 'copied', 'skipped', 'failed', 'cancelled') if status != 'cancelled' or any(e['status'] == 'cancelled' for e in job['events'])}
+        fk_events = [e for e in job['events'] if e['kind']=='foreign_key']
+        counts = {s: sum(e['status']==s for e in fk_events) for s in ('created','failed','skipped')}
+        integrity_status = ('not_requested' if foreign_key_policy=='omit' else
+            'not_confirmed' if counts['failed'] or counts['skipped'] or len(loaded)!=len(pairs) else
+            'partial' if omitted_fk_count else
+            'confirmed' if counts['created']==planned_fk_count and planned_fk_count else 'no_foreign_keys')
+        job['referential_integrity'] = dict(policy=foreign_key_policy,planned=planned_fk_count,
+            **counts,not_planned=omitted_fk_count,status=integrity_status)
         job['finished_at'] = datetime.now(timezone.utc).isoformat()

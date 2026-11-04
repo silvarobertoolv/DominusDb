@@ -206,6 +206,30 @@ def test_oracle_bulk_nullable_policy_reaches_export_and_default_load_policy(clie
     assert response.status_code==200 and captured['options']['oracle_empty_text']=='null'
 
 
+def test_constraint_plan_policy_export_and_reported_outcome(client,monkeypatch):
+    import migration
+    import sqlalchemy as sa
+    import io,json,zipfile
+    source=sa.create_engine('sqlite://')
+    meta=sa.MetaData(schema='main')
+    parent=sa.Table('p',meta,sa.Column('id',sa.Integer,primary_key=True))
+    sa.Table('c',meta,sa.Column('pid',sa.Integer),sa.ForeignKeyConstraint(['pid'],[parent.c.id],name='fk'))
+    meta.create_all(source);state['source']=source
+    monkeypatch.setattr(migration,'inventory',lambda _:dict(tables=[dict(id='main.'+n,schema='main',name=n) for n in ('p','c')],objects=[]))
+    blocked=post(client,'/api/plan',dict(tables=['main.c'],foreign_key_policy='strict')).get_json()
+    assert blocked['errors'] and blocked['foreign_key_policy']=='strict'
+    assert post(client,'/api/run',dict(plan_id=blocked['id'],confirmation='MIGRAR')).status_code==400
+    result=post(client,'/api/plan',dict(tables=['main.p','main.c'],foreign_key_policy='strict')).get_json()
+    assert not result['errors'] and result['foreign_key_policy']=='strict'
+    archive=zipfile.ZipFile(io.BytesIO(client.get('/api/export').data))
+    constraints=json.loads(archive.read('compatibilidade.json'))['constraints']
+    assert constraints['foreign_key_policy']=='strict'
+    assert any(c['kind']=='FOREIGN KEY' and c['status']=='planned' for c in constraints['objects'])
+    state['job']=dict(status='completed',events=[],referential_integrity=dict(status='confirmed',created=1,planned=1,policy='strict'))
+    assert client.get('/api/job').get_json()['referential_integrity']['status']=='confirmed'
+    assert client.get('/api/report').get_json()['referential_integrity']['created']==1
+
+
 def test_manual_mapping_can_unblock_plan_and_run_without_accepting_stale_id(client, monkeypatch):
     import sqlalchemy as sa
     import migration
