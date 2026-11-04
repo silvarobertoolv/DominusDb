@@ -1,6 +1,8 @@
 """Destination dialects and conservative metadata checks (no data scans)."""
 import hashlib
 import math
+import re
+import unicodedata
 import sqlalchemy as sa
 from sqlalchemy.dialects import mysql, postgresql, oracle
 from compatibility import target_limits as mysql_limits, check_and_adapt as mysql_check
@@ -56,6 +58,18 @@ def table_identifier(name, kind='mysql', limit=None):
         return name
     prefix = name[:limit-13] if kind == 'mysql' else encoded[:limit-13].decode('utf-8', errors='ignore')
     return prefix + '_' + hashlib.sha256(encoded).hexdigest()[:12]
+
+
+def column_identifier(name, kind, limit, name_case='preserve', naming='preserve'):
+    if naming == 'normalize':
+        name = unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode('ascii')
+        name = re.sub(r'[^A-Za-z0-9_]+', '_', name).strip('_') or 'COLUNA'
+        if name[0].isdigit(): name = 'C_' + name
+    if name_case == 'upper': name = name.upper()
+    if naming == 'normalize' and ((kind == 'oracle' and name == 'ROWID') or (kind == 'postgresql' and name in ('ctid','xmin','xmax','cmin','cmax','tableoid'))):
+        name = 'C_' + name
+    if naming == 'normalize': name = table_identifier(name, kind, limit)
+    return name.upper() if name_case == 'upper' else name
 
 
 def convert_native_type(t, kind):

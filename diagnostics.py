@@ -34,6 +34,7 @@ MYSQL_HINTS = {
 
 
 DESTINATION_HINTS = {
+    'ORA-03001':('recurso Oracle não implementado', 'Confira a etapa e a DDL anexada ao evento. Identificadores especiais exigem aspas; o erro também pode vir de tipo, versão ou consulta de metadados. Não atribua a causa somente ao nome da coluna.'),
     '42P07':('objeto existente','Atualize o plano ou escolha pular tabelas existentes.'),
     '23505':('dados duplicados','Há duplicidade em uma PK/UNIQUE; confira a origem.'),
     '23503':('integridade referencial','Existem registros sem chave referenciada.'),

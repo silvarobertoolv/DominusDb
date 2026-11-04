@@ -233,3 +233,25 @@ Para tentar novamente após uma falha, revise primeiro as tabelas criadas e os C
 Ao atualizar a regra de nomes, gere um novo plano antes de migrar. Tabelas criadas anteriormente com prefixo de schema não são renomeadas ou removidas automaticamente; confira o destino para evitar uma segunda cópia com o novo nome.
 
 A opção de caixa afeta somente nomes de tabelas no destino: `dbo.Clientes` → `Clientes` ou `CLIENTES`. A conversão para maiúsculas ocorre antes de calcular os limites e abreviar; o sufixo da abreviação também fica em maiúsculas. Colunas e dados mantêm seu comportamento atual. FKs, checagem de objetos existentes e DDL usam os nomes finais. Alterar a opção exige gerar e revisar outro plano; o relatório de compatibilidade registra `table_name_case` e os nomes resultantes. Tabelas existentes não são renomeadas.
+
+
+### Nomes de colunas e nulabilidade no Oracle
+
+Antes de gerar o plano, escolha a caixa das colunas (preservar origem ou MAIÚSCULAS) e a grafia:
+
+- **Preservar grafia**: conserva espaços e acentos. No Oracle, os identificadores das colunas são delimitados por aspas duplas em CREATE TABLE, INSERT e referências. Aspas internas são escapadas. Exemplo: `"Descrição Médica"`. Consultas manuais precisam respeitar a grafia e as aspas.
+- **Normalizar**: remove acentos, substitui espaços e outros caracteres por `_`, adiciona `C_` antes de nomes iniciados por número e abrevia os nomes que excederem o limite. Com maiúsculas: `Descrição Médica` → `DESCRICAO_MEDICA`. Colisões como `Situação` e `Situacao` bloqueiam a execução; não são unificadas.
+
+O mapeamento mantém os nomes originais na leitura do SQL Server e utiliza os nomes finais na DDL, carga, PKs, UNIQUEs, índices e FKs. Nomes de parâmetros Oracle usam identificadores ASCII internos, separados dos nomes das colunas. O plano mostra cada nome final e exporta `column_names`, `column_name_case` e `column_naming` no relatório de compatibilidade. As opções de caixa de tabelas e colunas são independentes.
+
+Oracle considera texto vazio equivalente a NULL. Para uma coluna textual obrigatória como `SEI` ou `DtNascConjuge`, se o negócio permitir ausência de valor:
+
+1. No mapeamento de colunas, marque **Permitir NULL somente no destino (remove NOT NULL)** nessa coluna.
+2. Aplique os ajustes e gere outro plano. Revise a advertência e a DDL: a coluna será opcional somente na tabela nova do destino.
+3. Escolha **Converter textos vazios para NULL** antes da execução.
+
+A alteração de nulabilidade é individual, exclusiva do destino Oracle e registrada em `nullable_overrides`. Nenhuma restrição da origem é alterada. PKs não podem usar esse ajuste. UNIQUE/FKs e regras de negócio precisam de revisão; texto vazio em uma coluna mapeada para número ou data continua exigindo conversão específica. Sem o ajuste explícito, NOT NULL continua bloqueando textos vazios. A opção não altera tabelas existentes nem completa uma carga anterior; prepare um destino novo para aplicar a nova DDL. As contagens de conversão usam o nome original da coluna para rastreabilidade.
+
+### Diagnóstico ORA-03001 durante DDL
+
+O evento com falha inclui a DDL gerada, a etapa exata (executar, confirmar COMMIT ou verificar metadados) e `ddl_committed`. Se este campo for verdadeiro, o objeto já pode existir apesar da falha de verificação; a carga permanece bloqueada, evitando considerar o objeto verificado. A interface permite expandir a DDL e o JSON conserva os detalhes. ORA-03001 significa recurso não implementado e também pode resultar de versão, tipo ou consulta de metadados; as aspas resolvem a representação dos nomes, mas não garantem eliminar todas as causas desse código. Os registros e parâmetros da carga não são anexados ao diagnóstico.

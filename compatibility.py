@@ -123,8 +123,8 @@ def check_and_adapt(pairs, limits):
                 if ref.table.name in protected: protected[ref.table.name].add(ref.name)
     # Preserve local FK columns even when the referenced table was not selected.
     for src, dst in pairs:
-        protected[dst.name].update(c.name for c in src.columns if c.foreign_keys)
-        protected[dst.name].update(src.info.get('source_fk_columns', set()))
+        protected[dst.name].update(dst.c[c.name].name for c in src.columns if c.foreign_keys and c.name in dst.c)
+        protected[dst.name].update(dst.c[name].name for name in src.info.get('source_fk_columns', set()) if name in dst.c)
 
     for src, table in pairs:
         table.dialect_options['mysql']['row_format'] = 'DYNAMIC'

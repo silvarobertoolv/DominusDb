@@ -217,8 +217,8 @@ def test_oracle_unique_index_is_emitted_as_constraint_for_fk_support(monkeypatch
     monkeypatch.setattr(migration,'inventory',lambda _:dict(tables=[dict(id='main.p',schema='main',name='p'),dict(id='main.c',schema='main',name='c')],objects=[]))
     result=plan(source,['main.p','main.c'],target_kind='oracle')
     assert not result['errors']
-    assert 'UNIQUE (code)' in result['ddl']
-    assert 'FOREIGN KEY(parent_code)' in result['ddl']
+    assert 'UNIQUE ("code")' in result['ddl']
+    assert 'FOREIGN KEY("parent_code")' in result['ddl']
 
 
 @pytest.mark.parametrize('kind,typ',[('postgresql',mssql.DATETIME2()),('postgresql',mssql.TIME()),('postgresql',mssql.DATETIMEOFFSET()),('oracle',mssql.TIME()),('oracle',mssql.DATETIMEOFFSET())])

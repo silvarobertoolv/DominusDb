@@ -4,7 +4,7 @@ from type_mapping import parse_target_type, validate_overrides
 from transfer import copy_table, TransferControl, MigrationCancelled, activity
 from compatibility import source_dictionary
 from source_catalog import source_inspector, reflect_source_table
-from target_profiles import destination_kind, destination_schema, dialect_for, identifier, table_identifier, convert_native_type, target_limits, check_and_adapt, KINDS
+from target_profiles import destination_kind, destination_schema, dialect_for, identifier, table_identifier, column_identifier, convert_native_type, target_limits, check_and_adapt, KINDS
 from datetime import datetime, timezone
 import sqlalchemy as sa
 from sqlalchemy.dialects import mysql, mssql
@@ -91,28 +91,36 @@ class PlanError(Exception):
         super().__init__(f'{stage}: {type(cause).__name__}')
 
 
-def plan(engine, selected, target=None, overrides=None, target_kind=None, table_name_case='preserve'):
+def plan(engine, selected, target=None, overrides=None, target_kind=None, table_name_case='preserve', column_name_case='preserve', column_naming='preserve', nullable_overrides=None):
     context = {'stage': 'Ler catálogo', 'object': None}
     try:
-        return _plan(engine, selected, context, target, validate_overrides(overrides), target_kind, table_name_case)
+        return _plan(engine, selected, context, target, validate_overrides(overrides), target_kind, table_name_case, column_name_case, column_naming, nullable_overrides)
     except Exception as exc:
         raise PlanError(context['stage'], context['object'], exc) from exc
 
 
-def _plan(engine, selected, context, target=None, overrides=None, target_kind=None, table_name_case='preserve'):
+def _plan(engine, selected, context, target=None, overrides=None, target_kind=None, table_name_case='preserve', column_name_case='preserve', column_naming='preserve', nullable_overrides=None):
     context.update(stage='Validar padrão dos nomes de tabelas', object=None)
     if table_name_case not in ('preserve', 'upper'):
         raise ValueError('Padrão dos nomes de tabelas inválido. Escolha preservar origem ou maiúsculas.')
+    if column_name_case not in ('preserve', 'upper') or column_naming not in ('preserve', 'normalize'):
+        raise ValueError('Padrão dos nomes de colunas inválido.')
+    if nullable_overrides is None: nullable_overrides = {}
+    if not isinstance(nullable_overrides, dict) or any(not isinstance(k, str) or not isinstance(v, list) or any(not isinstance(c, str) for c in v) for k,v in nullable_overrides.items()):
+        raise ValueError('Ajustes de nulabilidade inválidos; informe tabela e lista de colunas.')
     def case_name(name): return name.upper() if table_name_case == 'upper' else name
     kind = destination_kind(target, target_kind)
+    if kind != 'oracle' and any(nullable_overrides.values()): raise ValueError('Ajuste de nulabilidade disponível somente para Oracle.')
     label = KINDS[kind]
     dialect = dialect_for(kind)
     schema = destination_schema(target, kind)
     def named(a, b): return identifier(a, b, kind)
+    context.update(stage='Ler catálogo', object=None)
     catalog = inventory(engine)
     available = {t['id']: t for t in catalog['tables']}
     if not selected or len(selected) != len(set(selected)) or any(x not in available for x in selected):
         raise ValueError('Selecione tabelas válidas, sem duplicatas.')
+    if set(nullable_overrides) - set(selected): raise ValueError('Ajuste de nulabilidade aponta para tabela fora da seleção.')
     limits, limit_warnings = target_limits(target, kind)
     context.update(stage='Definir nomes das tabelas de destino', object=None)
     table_names, owners = {}, {}
@@ -153,29 +161,47 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
         definitions_by_name = {d['column_name']: d for d in definitions}
         unknown_columns = set(overrides.get(key, {})) - set(src.c.keys())
         if unknown_columns: errors.append(f'{key}: colunas de mapeamento inexistentes: ' + ', '.join(sorted(unknown_columns)))
+        allow_null = set(nullable_overrides.get(key, []))
+        if allow_null - set(src.c.keys()): errors.append(f'{key}: ajuste de nulabilidade aponta para coluna inexistente.')
         pk = set(c.name for c in src.primary_key.columns)
         columns = []
+        used_columns = {}
         for col in src.columns:
             context.update(stage='Converter coluna', object=f'{key}.{col.name}')
             manual = overrides.get(key, {}).get(col.name)
             entry = dict(table=key, column=col.name, source_type=str(col.type),
-                         requested_type=manual, target_type=None, automatic_type=None, error=None)
+                         requested_type=manual, target_type=None, automatic_type=None, error=None,
+                         source_nullable=col.nullable, primary_key=col.name in pk,
+                         allow_null=col.name in allow_null)
             column_mappings.append(entry)
             resolved_type = dictionary_type(col, definitions_by_name.get(col.name, {}))
             try:
+                name_limit = 64 if kind == 'mysql' else limits['identifier_bytes']
+                final_name = column_identifier(col.name, kind, name_limit, column_name_case, column_naming)
+                entry['target_name'] = final_name
+                name_length = len(final_name) if kind == 'mysql' else len(final_name.encode('utf-8'))
+                if name_length > name_limit: raise ValueError(f'nome da coluna excede o limite de {name_limit} do perfil {label}; escolha normalizar para abreviar')
+                if final_name.casefold() in used_columns: raise ValueError(f'colisão de nomes: {used_columns[final_name.casefold()]} e {col.name} resultam em {final_name}')
+                used_columns[final_name.casefold()] = col.name
+                if col.name in allow_null and col.name in pk: raise ValueError('chave primária não pode ser alterada para aceitar NULL')
                 try:
                     automatic = convert_type(resolved_type, kind)
                     entry['automatic_type'] = str(automatic.compile(dialect=dialect))
                 except ValueError:
                     if manual is None: raise
-                if len(col.name.encode('utf-8')) > limits['identifier_bytes']: raise ValueError(f'nome da coluna excede o limite de {limits["identifier_bytes"]} bytes do perfil {label}')
-                if kind == 'postgresql' and col.name in ('ctid','xmin','xmax','cmin','cmax','tableoid'): raise ValueError('nome conflita com coluna de sistema PostgreSQL; renomeação da origem necessária')
-                if kind == 'oracle' and col.name == 'ROWID': raise ValueError('ROWID em maiúsculas é reservado pelo Oracle; renomeação da origem necessária')
+                if kind == 'postgresql' and final_name in ('ctid','xmin','xmax','cmin','cmax','tableoid'): raise ValueError('nome conflita com coluna de sistema PostgreSQL; renomeação da origem necessária')
+                if kind == 'oracle' and final_name == 'ROWID': raise ValueError('ROWID em maiúsculas é reservado pelo Oracle; renomeação da origem necessária')
                 typ = parse_target_type(manual, kind) if manual is not None else automatic
                 entry['target_type'] = str(typ.compile(dialect=dialect))
-                columns.append(sa.Column(col.name, typ, nullable=False if col.name in pk else col.nullable,
+                entry['target_nullable'] = False if col.name in pk else True if col.name in allow_null else col.nullable
+                # Keep the source key for binding rows and resolving constraints;
+                # the SQL name is independent and escaped by the dialect.
+                columns.append(sa.Column(final_name, typ, key=col.name, quote=True if kind == 'oracle' and column_naming == 'preserve' else None,
+                                         nullable=entry['target_nullable'],
                                          autoincrement=False,
                                          info={'manual_type': manual is not None}))
+                if col.name in allow_null and not col.nullable:
+                    warnings.append(f'{key}.{col.name}: restrição NOT NULL removida SOMENTE no destino por escolha explícita. Com a política Oracle de texto vazio para NULL, valores vazios serão nulos; revise regras de negócio e UNIQUEs.')
                 if manual is not None:
                     warnings.append(f'{key}.{col.name}: tipo escolhido manualmente: {entry["target_type"]}. Revise a compatibilidade dos valores; a escolha não transforma os dados de origem.')
                 if any(value is not None for value in (col.default, col.server_default, col.computed, col.identity)):
@@ -233,7 +259,7 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
             uniques = inspector.get_unique_constraints(src.name, schema=src.schema)
         except NotImplementedError:
             uniques = []
-        indexed_unique = {tuple(c.name for c in idx.columns) for idx in dst.indexes if idx.unique} | {tuple(c.name for c in constraint.columns) for constraint in dst.constraints if isinstance(constraint,sa.UniqueConstraint)}
+        indexed_unique = {tuple(c.key for c in idx.columns) for idx in dst.indexes if idx.unique} | {tuple(c.key for c in constraint.columns) for constraint in dst.constraints if isinstance(constraint,sa.UniqueConstraint)}
         for unique in uniques:
             cols = unique.get('column_names', [])
             if cols and tuple(cols) not in indexed_unique and all(c in dst.c for c in cols):
@@ -253,6 +279,10 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
     compatibility['target_kind'] = kind
     compatibility['target_schema'] = schema
     compatibility['table_name_case'] = table_name_case
+    compatibility['column_name_case'] = column_name_case
+    compatibility['column_naming'] = column_naming
+    compatibility['nullable_overrides'] = nullable_overrides
+    compatibility['column_names'] = [{'table': src.fullname, 'source': c.key, 'target': c.name, 'nullable': c.nullable} for src,dst in pairs for c in dst.columns]
     compatibility['table_names'] = [{'source': src.fullname, 'target': dst.name, 'target_schema': dst.schema,
                                      'abbreviated': case_name(src.name) != dst.name} for src, dst in pairs]
     warnings.extend(compatibility.get('warnings', []))
@@ -294,6 +324,18 @@ def destination_objects(target):
 
 
 def _create_object(target, element, kind, table, name):
+    context = dict(stage='Executar DDL no destino', committed=False)
+    try:
+        return _create_object_impl(target, element, kind, table, name, context)
+    except Exception as exc:
+        exc.migration_ddl_stage = context['stage']
+        exc.migration_ddl_committed = context['committed']
+        try: exc.migration_ddl = str(element.compile(dialect=target.dialect))
+        except Exception: exc.migration_ddl = None
+        raise
+
+
+def _create_object_impl(target, element, kind, table, name, context):
     """Return server warnings and metadata verification after committed DDL."""
     result = {'message': 'DDL executado; COMMIT confirmado.', 'warnings': []}
     with target.connect() as conn:
@@ -302,7 +344,9 @@ def _create_object(target, element, kind, table, name):
             # SHOW WARNINGS must immediately follow the DDL on the same session.
             result['warnings'] = [diagnostic(RuntimeError(int(r[1]), r[2]), 'Aviso MySQL', name,
                                             (target,), hide_values=True) for r in conn.exec_driver_sql('SHOW WARNINGS').fetchall()]
+        context['stage'] = 'Confirmar COMMIT da DDL no destino'
         conn.commit()
+        context.update(stage='Verificar metadados após COMMIT da DDL', committed=True)
         inspector = sa.inspect(conn)
         if kind == 'table':
             found = inspector.has_table(table.name, **({'schema': table.schema} if table.schema else {}))
@@ -348,8 +392,13 @@ def execute(source, target, prepared, job, batch, existing_policy='abort', conti
         return entry
 
     def failure(exc, kind, name, table):
-        detail = diagnostic(exc, job['stage'], name, (source, target), hide_values=kind != 'table')
-        record(kind, name, table, 'failed', detail['message'], diagnostic=detail)
+        detail = diagnostic(exc, getattr(exc, 'migration_ddl_stage', job['stage']), name, (source, target), hide_values=kind != 'table')
+        extra = {}
+        if hasattr(exc, 'migration_ddl_committed'):
+            extra = dict(ddl=getattr(exc, 'migration_ddl', None), ddl_committed=exc.migration_ddl_committed)
+            if exc.migration_ddl_committed:
+                detail['hint'] += ' A DDL já teve COMMIT; a falha ocorreu ao verificar metadados. Inspecione o objeto antes de repetir.'
+        record(kind, name, table, 'failed', detail['message'], diagnostic=detail, **extra)
         if not continue_on_error: raise MigrationError(f"{kind} {name}: {detail['category']}. {detail['hint']}") from exc
 
     try:

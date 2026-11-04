@@ -105,7 +105,7 @@ def payload_chunks(rows, names, uuid_columns, max_bytes, destination=None, colum
                     textual=isinstance(typ,sa.String) or type(typ).__name__.upper() in ('CLOB','NCLOB')
                     if not textual: raise ValueError(f'{name}: texto vazio em destino não textual exige transformação específica; não será convertido automaticamente.')
                     if (column_nullable or {}).get(name) is not True:
-                        raise ValueError(f'{name}: conversão de texto vazio para NULL bloqueada: coluna NOT NULL/PK ou nulabilidade não confirmada. Defina um valor de negócio na origem; a aplicação não altera a restrição.')
+                        raise ValueError(f'{name}: conversão de texto vazio para NULL bloqueada: coluna NOT NULL/PK ou nulabilidade não confirmada. Para coluna não PK, se o negócio permitir, marque Permitir NULL somente no destino e gere outro plano. Para PK, defina um valor de negócio válido na origem.')
                     entry[name]=None
                     if conversion_counts is not None: conversion_counts[name]=conversion_counts.get(name,0)+1
                     continue
@@ -145,10 +145,15 @@ def copy_table(source, target, src, dst, job, batch, options, control):
     uuid_columns = [c.name for c in src.columns if type(c.type).__name__.upper() in ('UNIQUEIDENTIFIER', 'UUID')]
     destination=target.dialect.name
     target_label={'mysql':'MySQL','postgresql':'PostgreSQL','oracle':'Oracle'}.get(destination,'destino')
-    column_types={c.name:c.type for c in dst.columns}
-    column_nullable={c.name:c.nullable for c in dst.columns}
+    column_types={c.key:c.type for c in dst.columns}
+    column_nullable={c.key:c.nullable for c in dst.columns}
     pending_conversions={}
     stmt = dst.insert()  # Compile/cache the statement across batches.
+    oracle_bindings = None
+    if destination == 'oracle':
+        # Parameter names need not inherit spaces/accents from identifiers.
+        oracle_bindings = {c.key: f'sb_{i}' for i,c in enumerate(dst.columns)}
+        stmt = dst.insert().values({c: sa.bindparam(oracle_bindings[c.key], type_=c.type) for c in dst.columns})
     max_bytes = options.get('max_batch_mb', 8) * 1024 * 1024
     per_batch = options.get('transaction_mode', 'table') == 'batch'
     verify_count = options.get('verify_count', True)
@@ -216,7 +221,8 @@ def copy_table(source, target, src, dst, job, batch, options, control):
                         metrics['prepare_seconds'] += time.perf_counter() - stamp
                         control.checkpoint(job)
                         activity(job, f'Gravando lote em {target_label} ({len(payload)} linhas)')
-                        stamp = time.perf_counter(); out.execute(stmt, payload)
+                        parameters = [{oracle_bindings[key]: value for key,value in row.items()} for row in payload] if oracle_bindings is not None else payload
+                        stamp = time.perf_counter(); out.execute(stmt, parameters)
                         # PyMySQL exposes the warning count from the OK packet. Avoid
                         # a SHOW WARNINGS network round trip on every clean INSERT.
                         if target.dialect.name == 'mysql':

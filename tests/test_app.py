@@ -155,6 +155,33 @@ def test_plan_case_option_flows_into_ddl_export_and_existing_object_check(client
     assert 'Padrão dos nomes' in response.get_json()['error']
 
 
+def test_column_options_and_nullable_overrides_reach_oracle_plan_and_export(client, monkeypatch):
+    import sqlalchemy as sa
+    import migration
+    import io, json, zipfile
+    source = sa.create_engine('sqlite://')
+    sa.Table('t', sa.MetaData(schema='main'), sa.Column('id',sa.Integer,primary_key=True),
+             sa.Column('Descrição Médica',sa.String(40),nullable=False)).metadata.create_all(source)
+    state['source'] = source
+    monkeypatch.setattr(migration,'inventory',lambda _: dict(tables=[dict(id='main.t',schema='main',name='t')],objects=[]))
+    response = post(client,'/api/plan',dict(tables=['main.t'],target_kind='oracle',
+        column_name_case='upper',column_naming='normalize',nullable_overrides={'main.t':['Descrição Médica']}))
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data['column_name_case'] == 'upper' and data['column_naming'] == 'normalize'
+    assert data['column_mappings'][1]['target_name'] == 'DESCRICAO_MEDICA'
+    assert data['column_mappings'][1]['allow_null'] and data['column_mappings'][1]['target_nullable']
+    assert 'DESCRICAO_MEDICA' in data['ddl']
+    archive = zipfile.ZipFile(io.BytesIO(client.get('/api/export').data))
+    report = json.loads(archive.read('compatibilidade.json'))
+    assert report['nullable_overrides'] == {'main.t':['Descrição Médica']}
+    assert report['column_names'][1]['target'] == 'DESCRICAO_MEDICA'
+    response = post(client,'/api/plan',dict(tables=['main.t'],target_kind='oracle'))
+    assert '"Descrição Médica"' in response.get_json()['ddl']
+    for invalid in (['id'], {'main.t':'id'}, {'main.t':[None]}, {'unknown':['id']}):
+        assert post(client,'/api/plan',dict(tables=['main.t'],nullable_overrides=invalid)).status_code == 400
+
+
 def test_manual_mapping_can_unblock_plan_and_run_without_accepting_stale_id(client, monkeypatch):
     import sqlalchemy as sa
     import migration
