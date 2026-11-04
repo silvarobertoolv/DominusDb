@@ -91,26 +91,27 @@ class PlanError(Exception):
         super().__init__(f'{stage}: {type(cause).__name__}')
 
 
-def plan(engine, selected, target=None, overrides=None, target_kind=None, table_name_case='preserve', column_name_case='preserve', column_naming='preserve', nullable_overrides=None):
+def plan(engine, selected, target=None, overrides=None, target_kind=None, table_name_case='preserve', column_name_case='preserve', column_naming='preserve', nullable_overrides=None, oracle_nullable_text=False):
     context = {'stage': 'Ler catálogo', 'object': None}
     try:
-        return _plan(engine, selected, context, target, validate_overrides(overrides), target_kind, table_name_case, column_name_case, column_naming, nullable_overrides)
+        return _plan(engine, selected, context, target, validate_overrides(overrides), target_kind, table_name_case, column_name_case, column_naming, nullable_overrides, oracle_nullable_text)
     except Exception as exc:
         raise PlanError(context['stage'], context['object'], exc) from exc
 
 
-def _plan(engine, selected, context, target=None, overrides=None, target_kind=None, table_name_case='preserve', column_name_case='preserve', column_naming='preserve', nullable_overrides=None):
+def _plan(engine, selected, context, target=None, overrides=None, target_kind=None, table_name_case='preserve', column_name_case='preserve', column_naming='preserve', nullable_overrides=None, oracle_nullable_text=False):
     context.update(stage='Validar padrão dos nomes de tabelas', object=None)
     if table_name_case not in ('preserve', 'upper'):
         raise ValueError('Padrão dos nomes de tabelas inválido. Escolha preservar origem ou maiúsculas.')
     if column_name_case not in ('preserve', 'upper') or column_naming not in ('preserve', 'normalize'):
         raise ValueError('Padrão dos nomes de colunas inválido.')
+    if not isinstance(oracle_nullable_text, bool): raise ValueError('Opção Oracle de nulabilidade textual deve ser booleana.')
     if nullable_overrides is None: nullable_overrides = {}
     if not isinstance(nullable_overrides, dict) or any(not isinstance(k, str) or not isinstance(v, list) or any(not isinstance(c, str) for c in v) for k,v in nullable_overrides.items()):
         raise ValueError('Ajustes de nulabilidade inválidos; informe tabela e lista de colunas.')
     def case_name(name): return name.upper() if table_name_case == 'upper' else name
     kind = destination_kind(target, target_kind)
-    if kind != 'oracle' and any(nullable_overrides.values()): raise ValueError('Ajuste de nulabilidade disponível somente para Oracle.')
+    if kind != 'oracle' and (oracle_nullable_text or any(nullable_overrides.values())): raise ValueError('Ajuste de nulabilidade disponível somente para Oracle.')
     label = KINDS[kind]
     dialect = dialect_for(kind)
     schema = destination_schema(target, kind)
@@ -192,6 +193,9 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
                 if kind == 'postgresql' and final_name in ('ctid','xmin','xmax','cmin','cmax','tableoid'): raise ValueError('nome conflita com coluna de sistema PostgreSQL; renomeação da origem necessária')
                 if kind == 'oracle' and final_name == 'ROWID': raise ValueError('ROWID em maiúsculas é reservado pelo Oracle; renomeação da origem necessária')
                 typ = parse_target_type(manual, kind) if manual is not None else automatic
+                entry['nullable_policy_applied'] = bool(oracle_nullable_text and col.name not in pk and (isinstance(typ, sa.String) or type(typ).__name__.upper() in ('CLOB','NCLOB')))
+                if entry['nullable_policy_applied']: allow_null.add(col.name)
+                entry['allow_null'] = col.name in allow_null
                 entry['target_type'] = str(typ.compile(dialect=dialect))
                 entry['target_nullable'] = False if col.name in pk else True if col.name in allow_null else col.nullable
                 # Keep the source key for binding rows and resolving constraints;
@@ -282,6 +286,8 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
     compatibility['column_name_case'] = column_name_case
     compatibility['column_naming'] = column_naming
     compatibility['nullable_overrides'] = nullable_overrides
+    compatibility['oracle_nullable_text'] = oracle_nullable_text
+    compatibility['nullability_changes'] = [dict(table=e['table'], source_column=e['column'], target_column=e['target_name'], before='NOT NULL', after='NULL', reason='oracle_nullable_text' if e.get('nullable_policy_applied') else 'manual') for e in column_mappings if e.get('target_nullable') is True and e.get('source_nullable') is False and not e['error']]
     compatibility['column_names'] = [{'table': src.fullname, 'source': c.key, 'target': c.name, 'nullable': c.nullable} for src,dst in pairs for c in dst.columns]
     compatibility['table_names'] = [{'source': src.fullname, 'target': dst.name, 'target_schema': dst.schema,
                                      'abbreviated': case_name(src.name) != dst.name} for src, dst in pairs]

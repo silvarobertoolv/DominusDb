@@ -255,3 +255,16 @@ A alteração de nulabilidade é individual, exclusiva do destino Oracle e regis
 ### Diagnóstico ORA-03001 durante DDL
 
 O evento com falha inclui a DDL gerada, a etapa exata (executar, confirmar COMMIT ou verificar metadados) e `ddl_committed`. Se este campo for verdadeiro, o objeto já pode existir apesar da falha de verificação; a carga permanece bloqueada, evitando considerar o objeto verificado. A interface permite expandir a DDL e o JSON conserva os detalhes. ORA-03001 significa recurso não implementado e também pode resultar de versão, tipo ou consulta de metadados; as aspas resolvem a representação dos nomes, mas não garantem eliminar todas as causas desse código. Os registros e parâmetros da carga não são anexados ao diagnóstico.
+
+
+### Preparar várias colunas obrigatórias para textos vazios Oracle
+
+No catálogo, antes de **Gerar plano de migração**, o destino Oracle oferece **Preparar textos vazios para NULL no plano Oracle**. A opção é desmarcada por padrão. Ao marcar:
+
+- A DDL nova permite NULL nas colunas cujo tipo final de destino é textual (inclusive CLOB/NCLOB), exceto as que compõem a chave primária. Isso inclui colunas que eram NOT NULL na origem, mesmo que ainda não se saiba se contêm textos vazios.
+- A interface seleciona **Converter textos vazios para NULL** para a carga; a API também usa essa política quando não é informada explicitamente. Números, datas, binários e PKs permanecem protegidos.
+- O plano lista cada mudança de NOT NULL para NULL, registrada em `nullability_changes`, e registra a escolha em `oracle_nullable_text`. Os ajustes individuais continuam disponíveis quando essa política geral está desmarcada.
+
+Essa opção elimina a necessidade de marcar separadamente colunas textuais como `SEI`, `DtNascConjuge` ou `NmEquipe`, desde que elas não façam parte da PK e que o negócio permita ausência de valor. A origem permanece intacta. UNIQUEs, relacionamentos e aplicações que exigem valores nessas colunas precisam ser revisados. Se a regra exigir manter NOT NULL, mantenha a política desmarcada e corrija os valores de negócio na origem.
+
+É necessário gerar e revisar outro plano antes da criação das tabelas. Uma tabela criada em tentativa anterior continua com sua restrição: **Pular existente** não aplica a nova DDL nem completa cargas parciais. Use um schema/banco novo ou revise manualmente os artefatos existentes antes de repetir. O código `ORACLE_EMPTY_NOT_NULL` identifica especificamente a conversão bloqueada por coluna obrigatória; o diagnóstico orienta como preparar outra DDL. A migração não executa ALTER de restrições ou remoção automática de tabelas existentes.

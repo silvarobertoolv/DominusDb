@@ -31,6 +31,10 @@ class MigrationCancelled(Exception):
     pass
 
 
+class OracleEmptyNotNullError(ValueError):
+    migration_code = 'ORACLE_EMPTY_NOT_NULL'
+
+
 class TransferControl:
     def __init__(self, batch):
         self.condition = threading.Condition()
@@ -105,7 +109,7 @@ def payload_chunks(rows, names, uuid_columns, max_bytes, destination=None, colum
                     textual=isinstance(typ,sa.String) or type(typ).__name__.upper() in ('CLOB','NCLOB')
                     if not textual: raise ValueError(f'{name}: texto vazio em destino não textual exige transformação específica; não será convertido automaticamente.')
                     if (column_nullable or {}).get(name) is not True:
-                        raise ValueError(f'{name}: conversão de texto vazio para NULL bloqueada: coluna NOT NULL/PK ou nulabilidade não confirmada. Para coluna não PK, se o negócio permitir, marque Permitir NULL somente no destino e gere outro plano. Para PK, defina um valor de negócio válido na origem.')
+                        raise OracleEmptyNotNullError(f'{name}: conversão de texto vazio para NULL bloqueada: coluna NOT NULL/PK ou nulabilidade não confirmada. Para colunas textuais fora da PK, ative Preparar textos vazios para NULL no plano Oracle ou marque Permitir NULL somente no destino na coluna, e gere outra DDL. Para PK, defina um valor de negócio válido na origem.')
                     entry[name]=None
                     if conversion_counts is not None: conversion_counts[name]=conversion_counts.get(name,0)+1
                     continue

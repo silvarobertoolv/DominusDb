@@ -93,7 +93,7 @@ def make_plan():
     try:
         selected = (request.get_json() or {}).get('tables')
         if not isinstance(selected, list) or not all(isinstance(x, str) for x in selected): return error('Seleção inválida.')
-        prepared = plan(state['source'], selected, state['target'], (request.get_json() or {}).get('overrides'), (request.get_json() or {}).get('target_kind'), (request.get_json() or {}).get('table_name_case', 'preserve'), (request.get_json() or {}).get('column_name_case', 'preserve'), (request.get_json() or {}).get('column_naming', 'preserve'), (request.get_json() or {}).get('nullable_overrides'))
+        prepared = plan(state['source'], selected, state['target'], (request.get_json() or {}).get('overrides'), (request.get_json() or {}).get('target_kind'), (request.get_json() or {}).get('table_name_case', 'preserve'), (request.get_json() or {}).get('column_name_case', 'preserve'), (request.get_json() or {}).get('column_naming', 'preserve'), (request.get_json() or {}).get('nullable_overrides'), (request.get_json() or {}).get('oracle_nullable_text', False))
         prepared['id'] = secrets.token_urlsafe(24)
         prepared['destination_check'] = []
         if state['target'] is not None:
@@ -103,7 +103,7 @@ def make_plan():
             except Exception as exc:
                 detail = diagnostic(exc, 'Inspecionar destino', engines=(state['target'],))
                 prepared['warnings'].append(f"Não foi possível inspecionar o destino: {detail['message']}. A execução fará nova verificação.")
-        response = jsonify(column_name_case=prepared['compatibility'].get('column_name_case','preserve'), column_naming=prepared['compatibility'].get('column_naming','preserve'), nullable_overrides=prepared['compatibility'].get('nullable_overrides',{}), table_name_case=prepared.get('table_name_case','preserve'), target_kind=prepared.get('target_kind','mysql'), target_schema=prepared.get('target_schema'), type_examples=TYPE_EXAMPLES_BY_KIND[prepared.get('target_kind','mysql')], column_mappings=prepared.get('column_mappings', []), manual_mappings=prepared.get('manual_mappings', {}), compatibility=prepared.get('compatibility'), destination_check=prepared['destination_check'], id=prepared['id'], ddl=prepared['ddl'], warnings=prepared['warnings'], errors=prepared['errors'], objects=prepared['objects'], tables=[{'source': s.fullname, 'target': d.name, 'columns': [{'name': c.name, 'type': str(c.type.compile(dialect=dialect_for(prepared.get('target_kind','mysql'))))} for c in d.columns]} for s,d in prepared['pairs']])
+        response = jsonify(oracle_nullable_text=prepared['compatibility'].get('oracle_nullable_text',False), column_name_case=prepared['compatibility'].get('column_name_case','preserve'), column_naming=prepared['compatibility'].get('column_naming','preserve'), nullable_overrides=prepared['compatibility'].get('nullable_overrides',{}), table_name_case=prepared.get('table_name_case','preserve'), target_kind=prepared.get('target_kind','mysql'), target_schema=prepared.get('target_schema'), type_examples=TYPE_EXAMPLES_BY_KIND[prepared.get('target_kind','mysql')], column_mappings=prepared.get('column_mappings', []), manual_mappings=prepared.get('manual_mappings', {}), compatibility=prepared.get('compatibility'), destination_check=prepared['destination_check'], id=prepared['id'], ddl=prepared['ddl'], warnings=prepared['warnings'], errors=prepared['errors'], objects=prepared['objects'], tables=[{'source': s.fullname, 'target': d.name, 'columns': [{'name': c.name, 'type': str(c.type.compile(dialect=dialect_for(prepared.get('target_kind','mysql'))))} for c in d.columns]} for s,d in prepared['pairs']])
         state['plan'] = prepared
         return response
     except PlanError as exc: return plan_diagnostic(exc)
@@ -133,7 +133,7 @@ def run():
     if transaction_mode not in ('table', 'batch'): return error('Modo de transação inválido.')
     if not isinstance(verify_count, bool): return error('Opção de contagem deve ser booleana.')
     if isinstance(max_batch_mb, bool) or not isinstance(max_batch_mb, int) or not 1 <= max_batch_mb <= 64: return error('Limite do lote deve ser entre 1 e 64 MiB.')
-    oracle_empty_text = data.get('oracle_empty_text','error')
+    oracle_empty_text = data.get('oracle_empty_text', 'null' if (prepared.get('compatibility') or {}).get('oracle_nullable_text') else 'error')
     if oracle_empty_text not in ('error','null'): return error('Política de texto vazio inválida.')
     if oracle_empty_text != 'error' and prepared.get('target_kind','mysql') != 'oracle': return error('Conversão de textos vazios é uma opção exclusiva do Oracle.')
     options = dict(oracle_empty_text=oracle_empty_text, transaction_mode=transaction_mode, verify_count=verify_count, max_batch_mb=max_batch_mb)

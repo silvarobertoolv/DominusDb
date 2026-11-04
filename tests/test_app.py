@@ -182,6 +182,30 @@ def test_column_options_and_nullable_overrides_reach_oracle_plan_and_export(clie
         assert post(client,'/api/plan',dict(tables=['main.t'],nullable_overrides=invalid)).status_code == 400
 
 
+def test_oracle_bulk_nullable_policy_reaches_export_and_default_load_policy(client, monkeypatch):
+    import app as module
+    import migration
+    import sqlalchemy as sa
+    import io, json, zipfile
+    source=sa.create_engine('sqlite://')
+    sa.Table('t',sa.MetaData(schema='main'),sa.Column('id',sa.Integer,primary_key=True),
+             sa.Column('SEI',sa.String(50),nullable=False)).metadata.create_all(source)
+    state['source']=source
+    monkeypatch.setattr(migration,'inventory',lambda _:dict(tables=[dict(id='main.t',schema='main',name='t')],objects=[]))
+    data=post(client,'/api/plan',dict(tables=['main.t'],target_kind='oracle',oracle_nullable_text=True)).get_json()
+    assert data['oracle_nullable_text'] is True and data['column_mappings'][1]['target_nullable'] is True
+    archive=zipfile.ZipFile(io.BytesIO(client.get('/api/export').data))
+    assert json.loads(archive.read('compatibilidade.json'))['nullability_changes'][0]['source_column']=='SEI'
+    state['target']=object()
+    captured={}
+    class Thread:
+        def __init__(self,target,args,daemon):captured['options']=args[7]
+        def start(self):pass
+    monkeypatch.setattr(module.threading,'Thread',Thread)
+    response=post(client,'/api/run',dict(plan_id=data['id'],confirmation='MIGRAR'))
+    assert response.status_code==200 and captured['options']['oracle_empty_text']=='null'
+
+
 def test_manual_mapping_can_unblock_plan_and_run_without_accepting_stale_id(client, monkeypatch):
     import sqlalchemy as sa
     import migration

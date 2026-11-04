@@ -34,6 +34,7 @@ MYSQL_HINTS = {
 
 
 DESTINATION_HINTS = {
+    'ORACLE_EMPTY_NOT_NULL':('texto vazio em coluna obrigatória Oracle', 'No plano, ative Preparar textos vazios para NULL para tornar colunas textuais fora da PK opcionais no destino, ou ajuste a coluna individualmente. Gere outro plano e use uma tabela nova; pular existente não aplica a nova DDL. PKs exigem um valor válido.'),
     'ORA-03001':('recurso Oracle não implementado', 'Confira a etapa e a DDL anexada ao evento. Identificadores especiais exigem aspas; o erro também pode vir de tipo, versão ou consulta de metadados. Não atribua a causa somente ao nome da coluna.'),
     '42P07':('objeto existente','Atualize o plano ou escolha pular tabelas existentes.'),
     '23505':('dados duplicados','Há duplicidade em uma PK/UNIQUE; confira a origem.'),
@@ -64,7 +65,7 @@ DESTINATION_HINTS = {
 def diagnostic(exc, stage, object_name=None, engines=(), hide_values=False):
     original = getattr(exc, 'orig', exc)
     args = getattr(original, 'args', ())
-    code = getattr(original,'sqlstate',None) or getattr(original,'pgcode',None) or (args[0] if args and isinstance(args[0], int) else None)
+    code = getattr(original,'migration_code',None) or getattr(original,'sqlstate',None) or getattr(original,'pgcode',None) or (args[0] if args and isinstance(args[0], int) else None)
     oracle_code = getattr(args[0],'full_code',None) if args else None
     if oracle_code: code = oracle_code
     message = ' | '.join(a.decode('utf-8', errors='replace') if isinstance(a, bytes) else str(a) for a in args) if args else str(original)
@@ -82,7 +83,7 @@ def diagnostic(exc, stage, object_name=None, engines=(), hide_values=False):
     if hide_values:
         # MySQL embeds offending row values in quotes in duplicate/truncation errors.
         message = re.sub(r"'[^']*'|\"[^\"]*\"", '[valor oculto]', message)
-        if isinstance(code,str) or code in (1062, 1264, 1265, 1292, 1366, 1406):
+        if (isinstance(code,str) and not getattr(original,'migration_code',None)) or code in (1062, 1264, 1265, 1292, 1366, 1406):
             message = 'O servidor rejeitou valores da carga; conteúdo dos registros omitido.'
     category, hint = {**MYSQL_HINTS, **DESTINATION_HINTS}.get(code, ('erro de execução', 'Confira o objeto, a etapa e a mensagem; corrija a causa antes de repetir.'))
     if type(exc).__name__ in ('CompileError', 'UnsupportedCompilationError'):
