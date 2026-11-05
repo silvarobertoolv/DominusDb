@@ -82,13 +82,15 @@ def index_width(typ):
 def storage(typ):
     name = type(typ).__name__.upper()
     if is_lob(typ):
-        return 12, 20  # Logical descriptor and DYNAMIC external reference (DDL estimate).
+        # DYNAMIC uses a 20-byte external reference, but values up to 40
+        # bytes can remain inline. Reserve that small-value case + metadata.
+        return 12, 42
     if isinstance(typ, sa.String):
         size = (typ.length or 0) * 4
-        return size + (2 if size > 255 else 1), (size if name == 'CHAR' and size < 768 else 20 if size > 255 else size) + 2
+        return size + (2 if size > 255 else 1), (size if name == 'CHAR' and size < 768 else 40 if size > 255 else size) + 2
     if name in ('BINARY', 'VARBINARY'):
         size = typ.length or 0
-        return size + (2 if name == 'VARBINARY' else 0), ((20 if size > 255 else size) + 2 if name == 'VARBINARY' else size)
+        return size + (2 if name == 'VARBINARY' else 0), ((40 if size > 255 else size) + 2 if name == 'VARBINARY' else size)
     if isinstance(typ, sa.Numeric) and not isinstance(typ, sa.Float):
         size = decimal_bytes(typ.precision or 10, typ.scale or 0)
     else:
@@ -131,31 +133,43 @@ def check_and_adapt(pairs, limits):
         before = row_estimate(table)
         if len(table.columns) > limits['max_columns']:
             errors.append(f'{src.fullname}: {len(table.columns)} colunas excedem o limite InnoDB de {limits["max_columns"]}. Divida a tabela; conversão de tipos não resolve.')
-        candidates = sorted((c for c in table.columns if c.name not in protected[table.name] and not c.info.get('manual_type')
-                             and (isinstance(c.type, sa.String) and not is_lob(c.type)
-                                  or type(c.type).__name__.upper() == 'VARBINARY')),
-                            key=lambda c: storage(c.type)[0], reverse=True)
-        for col in candidates:
-            if not getattr(col.type, 'length', None): continue
-            estimate = row_estimate(table)
-            if estimate['logical_bytes'] <= limits['logical_row_budget'] and estimate['inline_bytes_estimate'] <= limits['inline_budget']:
-                break
-            old = type_sql(col.type)
-            old_width = storage(col.type)[0]
-            if old_width <= 12: continue  # A LOB descriptor would not reduce the logical row.
+        candidates = []
+        for col in table.columns:
+            if col.name in protected[table.name] or col.info.get('manual_type') or not getattr(col.type,'length',None): continue
+            if not (isinstance(col.type,sa.String) and not is_lob(col.type) or type(col.type).__name__.upper()=='VARBINARY'): continue
             if isinstance(col.type, sa.String):
                 max_bytes = col.type.length * 4
-                col.type = mysql.TEXT() if max_bytes <= 65535 else mysql.MEDIUMTEXT() if max_bytes <= 16777215 else mysql.LONGTEXT()
+                replacement = mysql.TEXT() if max_bytes <= 65535 else mysql.MEDIUMTEXT() if max_bytes <= 16777215 else mysql.LONGTEXT()
             else:
                 max_bytes = col.type.length
-                col.type = mysql.BLOB() if max_bytes <= 65535 else mysql.MEDIUMBLOB() if max_bytes <= 16777215 else mysql.LONGBLOB()
+                replacement = mysql.BLOB() if max_bytes <= 65535 else mysql.MEDIUMBLOB() if max_bytes <= 16777215 else mysql.LONGBLOB()
+            before_width, after_width = storage(col.type), storage(replacement)
+            logical_gain, inline_gain = (before_width[i]-after_width[i] for i in (0,1))
+            if logical_gain>0 and inline_gain>=0: candidates.append((col,replacement,logical_gain,inline_gain))
+        estimate = dict(before)
+        while candidates:
+            logical_pressure = estimate['logical_bytes'] > limits['logical_row_budget']
+            inline_pressure = estimate['inline_bytes_estimate'] > limits['inline_budget']
+            if not (logical_pressure or inline_pressure): break
+            # Large VARCHARs already eligible for external storage do not
+            # reduce local width; prefer short inline columns for >8126.
+            priority = 2 if logical_pressure else 3
+            candidate = max(candidates, key=lambda c: c[priority])
+            if candidate[priority] <= 0: break
+            candidates.remove(candidate)
+            col,replacement,logical_gain,inline_gain = candidate
+            old = type_sql(col.type)
+            col.type = replacement
+            estimate['logical_bytes'] -= logical_gain
+            estimate['inline_bytes_estimate'] -= inline_gain
             changes.append(dict(table=src.fullname, column=col.name, before=old, after=type_sql(col.type),
-                                reason='Reduzir tamanho máximo lógico da linha (1118), preservando a capacidade e sem alterar chaves/índices.'))
+                                logical_bytes_saved=logical_gain, inline_bytes_saved=inline_gain,
+                                reason='Reduzir linha lógica (65535) ou registro local InnoDB (1118 / >8126), preservando capacidade e sem alterar chaves/índices/tipos manuais.'))
         after = row_estimate(table)
         if after['logical_bytes'] > limits['logical_row_budget']:
             errors.append(f'{src.fullname}: linha estimada em {after["logical_bytes"]} bytes, acima do orçamento de {limits["logical_row_budget"]} (limite SQL 65535). Não há conversão automática segura restante; revise colunas protegidas por chaves/índices ou divida a tabela.')
         if after['inline_bytes_estimate'] > limits['inline_budget']:
-            errors.append(f'{src.fullname}: registro inline estimado em {after["inline_bytes_estimate"]} bytes excede o orçamento InnoDB de {limits["inline_budget"]}. Há muitos campos curtos/fixos; TEXT e DYNAMIC podem não resolver. Revise a estrutura.')
+            errors.append(f'{src.fullname}: registro inline estimado em {after["inline_bytes_estimate"]} bytes excede o orçamento InnoDB de {limits["inline_budget"]} (1118 / limite local, frequentemente 8126 bytes em páginas de 16 KiB). Campos fixos, chaves e muitos LOBs podem impedir uma conversão segura. Divida a estrutura ou revise as colunas protegidas; o plano não trunca dados nem remove constraints.')
         checks.append(dict(table=src.fullname, target=table.name, before=before, after=after,
                            protected_columns=sorted(protected[table.name]), row_format='DYNAMIC'))
         keys = [('PRIMARY', list(table.primary_key.columns))] if len(table.primary_key.columns) else []
@@ -179,4 +193,4 @@ def check_and_adapt(pairs, limits):
                 if not compatible_strings and type_sql(left) != type_sql(right):
                     errors.append(f'{src.fullname}: FK {fk.name}, {element.parent.name} ({type_sql(element.parent.type)}) e {element.column.table.name}.{element.column.name} ({type_sql(element.column.type)}) incompatíveis no MySQL (3780).')
     return dict(limits=limits, changes=changes, tables=checks, errors=errors,
-                note='Estimativas a partir do dicionário, sem ler valores das tabelas. Não garantem que o servidor aceitará todo registro; DYNAMIC e valores curtos podem afetar o tamanho real.')
+                note='Estimativas conservadoras a partir do dicionário, sem ler valores: DYNAMIC com referência externa de 20 bytes, mas valores de até 40 bytes podem permanecer inline (reserva de 42). Limites lógico e local são verificados separadamente. A validação definitiva é do servidor; estruturas sem conversão segura são bloqueadas.')

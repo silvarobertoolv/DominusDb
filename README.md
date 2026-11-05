@@ -109,7 +109,7 @@ A geração do plano consulta `sys.columns`, `sys.types`, `sys.tables` e `sys.sc
 
 Quando o destino está conectado, consulta `VERSION()` e `@@innodb_page_size`. O plano usa InnoDB com **ROW_FORMAT=DYNAMIC** e **utf8mb4 (até 4 bytes/caractere)**. Na ausência dessa consulta, informa a hipótese de MySQL 8 com página de 16 KiB; gere novamente com o destino conectado para confirmar. Versões diferentes de MySQL 8/9 recebem aviso para revisão. A página de 4/8/16 KiB corresponde a orçamento de índice de 768/1536/3072 bytes; páginas maiores permanecem em 3072.
 
-Para antecipar o **erro 1118**, estima o tamanho lógico máximo declarado por linha, com margem (orçamento de 60.000 bytes contra limite SQL de 65.535), e o registro local do InnoDB DYNAMIC. Este segundo cálculo aproxima ponteiros externos de campos variáveis grandes, metadados e campos fixos; não é uma simulação exata do InnoDB.
+Para antecipar o **erro 1118**, estima o tamanho lógico máximo declarado por linha, com margem (orçamento de 60.000 bytes contra limite SQL de 65.535), e o registro local do InnoDB DYNAMIC. Este segundo cálculo considera referências externas de 20 bytes, mas reserva 42 bytes para valores pequenos de até 40 bytes que podem permanecer inline, além de metadados e campos fixos; não é uma simulação exata do InnoDB.
 
 Se a linha exceder um dos orçamentos, tenta ampliar colunas **sem chaves/índices** de VARCHAR para TEXT/MEDIUMTEXT/LONGTEXT, e VARBINARY para BLOB/MEDIUMBLOB/LONGBLOB. Escolhe capacidade suficiente para o máximo declarado, considerando utf8mb4, e começa pelas maiores colunas. Nenhum conteúdo é cortado nem o comprimento é reduzido com base nos dados atuais. A conversão para LOB pode mudar as características de armazenamento e desempenho; revise a lista de ajustes. A DDL já é gerada com os tipos adaptados.
 
@@ -283,3 +283,22 @@ O plano mostra PKs, UNIQUEs, índices únicos, FKs, tabelas/colunas de destino e
 CHECKs e defaults T-SQL continuam exigindo adaptação manual; não fazem parte da garantia dos modos de FKs. Quando as definições de CHECK estão disponíveis, são listadas como manuais. Ajustes explícitos de nulabilidade Oracle continuam alterando o NOT NULL do destino; selecionar o modo estrito de FKs não desfaz essas escolhas. Revise as regras de negócio, comparações/collation e semântica de NULL e UNIQUE no destino.
 
 O ZIP inclui `constraints.foreign_key_policy`, ordem e objetos em `compatibilidade.json`. O JSON da execução e o monitor exibem `referential_integrity`: FKs planejadas, criadas, com falha, puladas e fora do plano. `confirmed` significa que todas as FKs planejadas foram criadas e verificadas no catálogo, sem omissões e com as cargas confirmadas; não equivale a checksum ou validação de todas as regras de negócio. Sem FKs o resultado é `no_foreign_keys`; aplicação parcial, falha e omissão explícita têm estados próprios. O resultado não altera tabelas existentes nem executa rollback de DDL/cargas já confirmadas em caso de falha. Use um destino novo quando precisar repetir a criação com outra política.
+
+
+### Erro MySQL 1118 com registro local maior que 8126 bytes
+
+`Row size too large (> 8126) ... BLOB prefix of 0 bytes is stored inline` identifica o limite local de registro do InnoDB (comum com páginas de 16 KiB). Ele é diferente do limite lógico SQL de 65.535 bytes. ROW_FORMAT=DYNAMIC não elimina todos os casos: referências externas ocupam espaço e valores pequenos de TEXT/BLOB podem permanecer na linha. Mudar todos os campos para TEXT indiscriminadamente pode continuar falhando.
+
+Com o destino MySQL conectado, gere outro plano. A análise consulta o tamanho de página e verifica os dois orçamentos separadamente. A conversão automática prioriza a redução que resolve o limite excedido: VARCHARs grandes ajudam no limite lógico; quando somente o registro local está excedido, prioriza campos inline cuja conversão para TEXT/BLOB economiza espaço local. O relatório registra `logical_bytes_saved` e `inline_bytes_saved` por ajuste. A capacidade declarada é mantida usando TEXT/MEDIUMTEXT/LONGTEXT ou BLOB/MEDIUMBLOB/LONGBLOB conforme necessário. PKs, UNIQUEs, índices, FKs (incluindo referências de outras tabelas) e tipos manuais ficam protegidos.
+
+Quando muitos LOBs pequenos, campos fixos ou colunas protegidas ainda excedem o orçamento, o plano bloqueia a execução com uma orientação estrutural. Nesses casos pode ser necessário dividir a tabela após análise do modelo; a aplicação não remove colunas/constraints, não trunca valores e não altera tabelas já criadas. A estimativa permanece conservadora e baseada no dicionário: a aceitação final depende do servidor e dos valores reais. Reduzir lote ou max_allowed_packet não resolve um registro individual que excede o limite local.
+
+Para aplicar as conversões, use a DDL nova em um destino novo ou revise manualmente os artefatos anteriores. **Pular existente** preserva a DDL antiga e não completa cargas parciais.
+
+Oracle usa CLOB/NCLOB/BLOB conforme os tipos e capacidades; PostgreSQL usa TEXT/BYTEA e TOAST. As regras de InnoDB e ROW_FORMAT não são aplicadas a esses perfis.
+
+### Banco e driver associados ao erro
+
+A conexão mostra o produto e o driver efetivamente utilizados; o plano registra `connection_context` com origem, destino e perfil planejado. Falhas DBAPI capturadas pelas conexões incluem `database_context`: papel source/target, dialeto, driver, versão quando disponível e classe de comando (SELECT/CREATE/INSERT etc.). Não inclui host, URL, usuário, senha, SQL completo ou parâmetros. A interface, os diagnósticos de plano e o relatório JSON exibem essas informações disponíveis.
+
+Se uma mensagem 1118/InnoDB for recebida numa conexão Oracle ou SQL Server, `reported_family` e `context_mismatch` ajudam a distinguir a família da mensagem do driver que a recebeu. Verifique a etapa, gateways/servidores vinculados ou um relatório de outra migração; isso não prova por si só qual servidor remoto iniciou a falha. Erros de aplicação e drivers sem suporte a atributos podem não fornecer contexto exato; `connections` ainda lista os produtos/drivers envolvidos, sem credenciais.

@@ -40,6 +40,36 @@ def test_small_table_requires_no_change():
     assert not report['errors'] and not report['changes']
 
 
+def test_inline_budget_prioritizes_short_columns_with_real_local_savings():
+    src,dst=wide_pair(count=36,length=63)
+    # A long variable column is already eligible for external storage. Making
+    # it TEXT saves logical bytes but does not solve the local-record problem.
+    dst.append_column(sa.Column('long_note',sa.String(4000)))
+    report=check_and_adapt([(src,dst)],target_limits()[0])
+    assert not report['errors']
+    assert isinstance(dst.c.long_note.type,sa.String) and not isinstance(dst.c.long_note.type,sa.Text)
+    assert report['tables'][0]['before']['logical_bytes']<60000
+    assert report['tables'][0]['before']['inline_bytes_estimate']>8126
+    assert all(c['inline_bytes_saved']>0 for c in report['changes'])
+    assert report['tables'][0]['after']['inline_bytes_estimate']<=report['limits']['inline_budget']
+
+
+def test_small_lobs_are_not_estimated_as_only_external_pointers():
+    src,dst=wide_pair(count=200,length=4000)
+    for col in list(dst.columns)[1:]:col.type=mysql.TEXT()
+    report=check_and_adapt([(src,dst)],target_limits()[0])
+    assert report['tables'][0]['before']['inline_bytes_estimate']>8126
+    assert any('registro inline' in e and '1118' in e for e in report['errors'])
+    assert not report['changes']  # No truncation or arbitrary schema split.
+
+
+def test_inline_budget_keeps_manual_and_key_columns_unchanged():
+    src,dst=wide_pair(count=36,length=63)
+    for col in list(dst.columns)[1:]:col.info['manual_type']=True
+    report=check_and_adapt([(src,dst)],target_limits()[0])
+    assert not report['changes'] and any('registro inline' in e for e in report['errors'])
+
+
 def test_mediumtext_preserves_large_declared_capacity():
     src,dst=wide_pair(count=1,length=20000)
     report=check_and_adapt([(src,dst)],target_limits()[0])

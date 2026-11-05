@@ -1,5 +1,5 @@
 """SQL Server inventory and conservative MySQL migration planner."""
-from diagnostics import diagnostic
+from diagnostics import diagnostic, connection_context
 from type_mapping import parse_target_type, validate_overrides
 from transfer import copy_table, TransferControl, MigrationCancelled, activity
 from compatibility import source_dictionary
@@ -309,6 +309,7 @@ def _plan(engine, selected, context, target=None, overrides=None, target_kind=No
         note='CHECKs e defaults exigem adaptação manual. Alterações explícitas de nulabilidade continuam válidas.')
     if foreign_key_policy=='omit': warnings.append('FKs omitidas por escolha explícita. A integridade referencial não será imposta por esta migração; PKs e UNIQUEs continuam incluídas.')
     compatibility['target_kind'] = kind
+    compatibility['connection_context'] = dict(source=connection_context(engine,'source'),target=connection_context(target,'target') if target is not None else None,planned_target=kind)
     compatibility['target_schema'] = schema
     compatibility['table_name_case'] = table_name_case
     compatibility['column_name_case'] = column_name_case

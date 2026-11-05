@@ -57,7 +57,7 @@ def connect(kind):
         if state[kind]: state[kind].dispose()
         state[kind] = engine
         state['plan'] = None
-        return jsonify(ok=True, target_kind=engine.dialect.name, target_schema=getattr(engine,'_sqlbridge_schema',None))
+        return jsonify(ok=True, target_kind=engine.dialect.name, target_driver=getattr(engine.dialect,'driver',None), target_schema=getattr(engine,'_sqlbridge_schema',None))
     except Exception as exc:
         if engine: engine.dispose()
         return request_diagnostic(exc, 'Conectar ' + kind, engines=(engine,))
@@ -77,6 +77,9 @@ def request_diagnostic(exc, stage, object_name=None, engines=()):
     text = (f"Falha [{detail['reference']}]. Etapa: {stage}. Objeto: {object_name or 'catálogo'}. "
             f"{detail['exception']} / {detail['driver_exception']}: {detail['message']} "
             f"Orientação: {detail['hint']}")
+    if detail.get('database_context'):
+        db=detail['database_context']
+        text+=f' Conexão da operação: {db["role"]} / {db["dialect"]} / {db["driver"]}; comando {db.get("operation") or "indisponível"}.'
     app.logger.error('%s', text)
     return jsonify(error=text, diagnostic=detail), 400
 

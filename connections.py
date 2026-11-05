@@ -3,6 +3,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import URL
 from transfer import WarningTrackingCursor
 from target_profiles import KINDS
+from diagnostics import register_error_context
 
 
 def engine_for(data, kind):
@@ -36,6 +37,7 @@ def engine_for(data, kind):
         args=dict(tcp_connect_timeout=10)
         if data.get('tls'):args.update(protocol='tcps',ssl_server_dn_match=True)
     engine=sa.create_engine(url,connect_args=args,pool_pre_ping=True,hide_parameters=True,echo=False,**extra)
+    register_error_context(engine,kind)
     if destination=='mssql': engine._sqlbridge_metadata_mode=mode
     schema=data.get('schema','').strip() if kind=='target' else ''
     engine._sqlbridge_schema=(schema or 'public') if destination=='postgresql' else (schema.upper() or None) if destination=='oracle' else None

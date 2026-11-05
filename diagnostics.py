@@ -2,6 +2,26 @@
 import re
 import secrets
 
+
+def connection_context(engine, role=None):
+    """Only product/driver/version, never host, database, URL or credentials."""
+    dialect = getattr(engine, 'dialect', None)
+    return dict(role=role or getattr(engine,'_sqlbridge_role','unknown'),
+        dialect=getattr(dialect,'name',None), driver=getattr(dialect,'driver',None),
+        server_version='.'.join(map(str,getattr(dialect,'server_version_info',None) or ())) or None)
+
+
+def register_error_context(engine, role):
+    import sqlalchemy as sa
+    engine._sqlbridge_role = role
+    @sa.event.listens_for(engine, 'handle_error')
+    def attribute_database_error(context):
+        details=connection_context(engine,role)
+        operation=re.match(r'\s*(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|SET|SHOW|WITH)\b',context.statement or '',re.I)
+        details['operation']=operation.group(1).upper() if operation else None
+        try: context.original_exception.migration_database_context=details
+        except (AttributeError,TypeError): pass  # Preserve the original error.
+
 MYSQL_HINTS = {
     102: ('sintaxe/compatibilidade de origem', 'Se ocorrer na reflexão, reconecte usando Catálogo compatível. A aplicação usa fallback para metadados sys.* sem alterar o SQL Server.'),
     156: ('sintaxe/compatibilidade de origem', 'Confira a etapa; na reflexão use Catálogo compatível e gere novamente o plano.'),
@@ -14,7 +34,7 @@ MYSQL_HINTS = {
     1062: ('dados incompatíveis', 'Há valores duplicados para uma chave UNIQUE ou primária.'),
     1064: ('DDL incompatível', 'Revise a sintaxe e a versão do MySQL.'),
     1071: ('limite de índice', 'A chave excede o limite em bytes do MySQL. Revise tipo, tamanho e charset.'),
-    1118: ('limite de linha', 'A linha excede o limite do InnoDB. Considere TEXT/BLOB ou reduzir VARCHARs.'),
+    1118: ('limite de linha MySQL/InnoDB', 'Gere novamente o plano com o destino conectado: ele verifica o limite lógico de 65535 e o registro local InnoDB (ex.: >8126). Converta somente colunas elegíveis para TEXT/BLOB; se campos fixos, LOBs ou chaves ainda excederem o limite, divida a estrutura. Não reduza comprimentos nem remova constraints automaticamente.'),
     1142: ('permissão', 'Conceda CREATE, INSERT, ALTER, INDEX, SELECT e REFERENCES conforme a operação.'),
     1153: ('registro/pacote muito grande', 'Reduza o lote; se uma única linha exceder max_allowed_packet, ajuste o limite do MySQL após avaliação.'),
     1170: ('índice incompatível', 'TEXT/BLOB exige prefixo de índice. Revise o tipo ou adapte o índice manualmente.'),
@@ -72,6 +92,10 @@ def diagnostic(exc, stage, object_name=None, engines=(), hide_values=False):
     if code is None or isinstance(code,int):
         match=re.search(r'\b(ORA-\d{5}|DPY-\d{4})\b',message)
         if match:code=match.group(1)
+    connections=[connection_context(e) for e in engines if e is not None]
+    database_context=getattr(original,'migration_database_context',None) or getattr(exc,'migration_database_context',None)
+    reported_family='mysql/innodb' if code==1118 and 'row size too large' in message.lower() else 'oracle' if isinstance(code,str) and code.startswith(('ORA-','DPY-')) else None
+    context_mismatch=bool(reported_family=='mysql/innodb' and database_context and database_context.get('dialect') not in (None,'mysql'))
     # DBAPIError.__str__ would append SQL/parameters; only use .orig above.
     message = message.split('[SQL:')[0].split('[parameters:')[0]
     for engine in engines:
@@ -86,10 +110,14 @@ def diagnostic(exc, stage, object_name=None, engines=(), hide_values=False):
         if (isinstance(code,str) and not getattr(original,'migration_code',None)) or code in (1062, 1264, 1265, 1292, 1366, 1406):
             message = 'O servidor rejeitou valores da carga; conteúdo dos registros omitido.'
     category, hint = {**MYSQL_HINTS, **DESTINATION_HINTS}.get(code, ('erro de execução', 'Confira o objeto, a etapa e a mensagem; corrija a causa antes de repetir.'))
+    if context_mismatch:
+        hint += f' A mensagem é de MySQL/InnoDB, mas a operação foi recebida pelo driver {database_context["dialect"]}. Confira a etapa, a conexão real e eventuais gateways/servidores vinculados; não aplique ROW_FORMAT ou TEXT MySQL ao perfil Oracle/PostgreSQL.'
     if type(exc).__name__ in ('CompileError', 'UnsupportedCompilationError'):
         category, hint = 'DDL incompatível', 'Revise os tipos e a definição do objeto para o dialeto do destino selecionado.'
     if isinstance(exc, NotImplementedError):
         category, hint = 'metadado não suportado', 'O driver não implementa esta reflexão de metadados.'
     return {'reference': secrets.token_hex(6), 'stage': stage, 'object': object_name,
             'exception': type(exc).__name__, 'driver_exception': type(original).__name__,
-            'code': code, 'category': category, 'hint': hint, 'message': message[:3000] or 'Exceção sem mensagem.'}
+            'code': code, 'category': category, 'hint': hint, 'message': message[:3000] or 'Exceção sem mensagem.',
+            'database_context':database_context,'connections':connections,
+            'reported_family':reported_family,'context_mismatch':context_mismatch}
